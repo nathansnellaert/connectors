@@ -14,6 +14,7 @@ from . import duckdb
 from .config import validate_environment, get_data_dir, is_cloud, get_fs
 from .publish import publish
 from .testing import validate
+from .health import run_health_tests
 from . import debug
 from . import catalog
 
@@ -35,5 +36,5 @@ __all__ = [
     # Config
     'validate_environment', 'get_data_dir', 'is_cloud', 'get_fs',
     # Other
-    'validate', 'DAG', 'load_nodes', 'NodeSpec', 'MaintainSpec', 'duckdb',
+    'validate', 'run_health_tests', 'DAG', 'load_nodes', 'NodeSpec', 'MaintainSpec', 'duckdb',
 ]
