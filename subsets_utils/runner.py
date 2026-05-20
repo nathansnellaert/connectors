@@ -415,7 +415,30 @@ def _upload_server_run_manifest(connector: str, run_id: str, log_dir: Path):
         print(f"[runner] Failed to upload server manifest: {e}")
 
 
+def _expand_bundled_secrets() -> None:
+    """Expand the single-repo secret blob into the environment.
+
+    The connectors repo runs every connector through one workflow, which
+    passes all Actions secrets as one JSON object in `HARNESS_SECRETS`
+    (`toJSON(secrets)`). Expand it before anything reads R2/API credentials.
+    `setdefault` so an explicitly-set env var always wins.
+    """
+    blob = os.environ.pop("HARNESS_SECRETS", None)
+    if not blob:
+        return
+    try:
+        bundle = json.loads(blob)
+    except json.JSONDecodeError:
+        return
+    if isinstance(bundle, dict):
+        for key, val in bundle.items():
+            if isinstance(val, str):
+                os.environ.setdefault(key, val)
+
+
 def main():
+    _expand_bundled_secrets()
+
     connector = get_connector_name()
     os.environ["CONNECTOR_NAME"] = connector
 
