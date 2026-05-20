@@ -1,0 +1,11 @@
+# Per-connector generated dirs — never committed.
+*/.venv/
+*/data/
+*/log/
+*/logs/
+
+# Python bytecode
+**/__pycache__/
+*.py[cod]
+
+.DS_Store
