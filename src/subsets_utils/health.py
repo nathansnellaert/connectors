@@ -89,10 +89,11 @@ def run_health_tests(connector_root) -> None:
         n.get("id") for n in (run.get("dag", {}).get("nodes") or [])
         if isinstance(n, dict) and n.get("id")
     ]
-    results = _run_test_file(tests_file, {
-        "slug": os.environ.get("CONNECTOR_NAME", ""),
-        "spec_ids": spec_ids,
-    })
+    available = {"slug": os.environ.get("CONNECTOR_NAME", ""), "spec_ids": spec_ids}
+    if target == "transform":
+        suffix = "-transform"
+        available["subset_ids"] = [i[:-len(suffix)] for i in spec_ids if i.endswith(suffix)]
+    results = _run_test_file(tests_file, available)
 
     run["tests"] = results
     try:
