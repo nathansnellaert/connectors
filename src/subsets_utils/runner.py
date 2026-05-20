@@ -33,7 +33,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .config import is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name
+from .config import (
+    is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name,
+    get_r2_prefix,
+)
 from . import debug
 
 
@@ -217,8 +220,10 @@ def _generate_run_id() -> str:
 
 
 def _connector_runs_prefix(connector: str, run_id: str) -> str:
-    """R2 prefix for a run's artifacts."""
-    return f"{connector}/runs/{run_id}"
+    """R2 prefix for a run's artifacts: [<R2_PREFIX>/]<connector>/runs/<run_id>."""
+    prefix = get_r2_prefix()
+    base = f"{connector}/runs/{run_id}"
+    return f"{prefix}/{base}" if prefix else base
 
 
 def _hydrate_resume_state(connector: str, run_id: str, log_dir: Path) -> bool:

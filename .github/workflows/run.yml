@@ -39,7 +39,7 @@ jobs:
         with:
           enable-cache: true
       - name: Run connector
-        working-directory: ${{ inputs.slug }}
+        working-directory: src/${{ inputs.slug }}
         run: |
           uv sync
           uv run python -m src.subsets_utils.runner
@@ -50,6 +50,10 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           DAG_TARGET: ${{ inputs.dag_target }}
           DAG_ON_FAILURE: ${{ inputs.dag_on_failure }}
+          # Path prefix under the R2 bucket — lets the harness share a bucket
+          # with another project without slug collisions. Plain config, not a
+          # secret; the harness must set the same R2_PREFIX in its env.
+          R2_PREFIX: harness
           # Single-repo: every Actions secret arrives as one JSON blob; the
           # connector runner expands it into the environment at startup. No
           # per-connector env wiring — `sync_secrets.py` is the only place

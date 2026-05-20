@@ -186,9 +186,21 @@ def get_fs(uri: str = ""):
 # _write_bytes helpers.
 # =============================================================================
 
+def get_r2_prefix() -> str:
+    """Optional path prefix under the bucket (from `R2_PREFIX`, empty default).
+
+    Lets this project share an R2 bucket with another without slug collisions:
+    with `R2_PREFIX=harness`, a connector's data lives under
+    `<bucket>/harness/<connector>/...` instead of `<bucket>/<connector>/...`.
+    """
+    return os.environ.get("R2_PREFIX", "").strip("/")
+
+
 def get_r2_base() -> str:
-    """Get R2 base path for current connector: <connector>/data"""
-    return f"{get_connector_name()}/data"
+    """Get R2 base path for current connector: [<prefix>/]<connector>/data"""
+    prefix = get_r2_prefix()
+    base = f"{get_connector_name()}/data"
+    return f"{prefix}/{base}" if prefix else base
 
 
 def raw_key(asset_id: str, ext: str = "parquet", *, entity_id: str | None = None) -> str:

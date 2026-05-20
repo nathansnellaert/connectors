@@ -1,8 +1,8 @@
 # Per-connector generated dirs — never committed.
-*/.venv/
-*/data/
-*/log/
-*/logs/
+**/.venv/
+**/data/
+**/log/
+**/logs/
 
 # Python bytecode
 **/__pycache__/
