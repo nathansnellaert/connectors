@@ -17,8 +17,18 @@ live against the API on 2026-05-28 — research's notes were partly stale (apps
 top-grossing / new-apps-we-love, books coming-soon all 404; music uses
 feed_type=most-played with the chart kind carried in the final URL segment, not
 top-songs/top-albums; limit caps at 100, 200 returns HTTP 500).
+
+Per-storefront isolation: a single (country, feed) failure must never sink the
+whole spec. Some storefronts structurally lack a given media and Apple answers
+with a *persistent* HTTP 500 — e.g. Books and Audiobooks in the China (cn)
+storefront, which has no Apple Books / Audiobooks section. Other 500s are
+transient (kr/vn/eg books charts were observed flipping 500->200 within
+seconds) and are recovered by the retry decorator. So we retry every 5xx, and
+if it still fails after the retries are exhausted we skip just that storefront
+and keep going. A true global outage surfaces via the `fetched == 0` guard.
 """
 
+import json
 import httpx
 from datetime import datetime, timezone
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -62,21 +72,29 @@ _TRANSIENT_EXC = (
     httpx.WriteTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError, httpx.ProxyError,
 )
 
+# Failures that mean "this one storefront/feed is not serving this chart right
+# now" rather than "the whole spec is broken". Caught per-(country, feed) in the
+# fetch loop and skipped — only after the retry decorator below has already
+# exhausted its attempts on the transient classes.
+_SKIPPABLE_EXC = (httpx.HTTPStatusError, *_TRANSIENT_EXC, json.JSONDecodeError)
+
 
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, _TRANSIENT_EXC):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
-        # Apple returns sporadic 503s under load; retry 429 + all 5xx.
+        # Apple returns sporadic 5xx under load and for some storefronts; retry
+        # 429 + all 5xx. A *persistent* 5xx (storefront lacks this media) just
+        # burns the retry budget and is then skipped per-storefront downstream.
         return code == 429 or 500 <= code < 600
     return False
 
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(6),
-    wait=wait_exponential(min=2, max=60),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=2, max=30),
     reraise=True,
 )
 def _fetch_chart(country: str, media: str, feed_type: str, segment: str) -> dict:
@@ -101,15 +119,17 @@ def fetch_one(entity_id: str) -> None:
         for country in COUNTRIES:
             try:
                 data = _fetch_chart(country, media, feed_type, segment)
-            except httpx.HTTPStatusError as e:
-                code = e.response.status_code
-                # Permanent 4xx (storefront lacks this chart family) -> skip this
-                # (country, feed) and keep going. Transient codes were already
-                # retried-then-reraised by the decorator, so re-raise those.
-                if 400 <= code < 500 and code != 429:
-                    skipped.append(f"{country}/{feed_type}:{code}")
-                    continue
-                raise
+            except _SKIPPABLE_EXC as e:
+                # By the time we land here the retry decorator has exhausted its
+                # attempts, so this (country, feed) is not serving this chart
+                # right now: a 4xx feed/storefront gap, a 5xx that persisted
+                # across every retry (e.g. cn Books/Audiobooks — China has no
+                # such store), an unparseable body, or a network error that
+                # never recovered. Skip just this storefront and keep going;
+                # the `fetched == 0` guard below catches a true global outage.
+                tag = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
+                skipped.append(f"{country}/{feed_type}:{tag}")
+                continue
 
             feed = data.get("feed", {})
             results = feed.get("results", []) or []
