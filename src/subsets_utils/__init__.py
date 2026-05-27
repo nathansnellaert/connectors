@@ -1,7 +1,8 @@
 from .http_client import get, post, put, delete, get_client, configure_http
 from .io import (
-    load_state, save_state, load_asset,
+    load_state, save_state, record_completion, load_asset,
     save_raw_json, load_raw_json,
+    save_raw_ndjson, load_raw_ndjson,
     save_raw_file, load_raw_file,
     save_raw_parquet, load_raw_parquet, raw_parquet_localpath,
     list_raw_files, delete_raw_file, data_hash, raw_parquet_hash, raw_asset_exists,
@@ -26,8 +27,10 @@ __all__ = [
     # Publishing
     'publish',
     # State & raw I/O
-    'load_state', 'save_state', 'load_asset', 'data_hash', 'raw_parquet_hash',
-    'save_raw_json', 'load_raw_json', 'save_raw_file', 'load_raw_file',
+    'load_state', 'save_state', 'record_completion', 'load_asset', 'data_hash', 'raw_parquet_hash',
+    'save_raw_json', 'load_raw_json',
+    'save_raw_ndjson', 'load_raw_ndjson',
+    'save_raw_file', 'load_raw_file',
     'save_raw_parquet', 'load_raw_parquet', 'raw_parquet_localpath',
     'list_raw_files', 'delete_raw_file',
     'raw_asset_exists',

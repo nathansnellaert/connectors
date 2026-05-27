@@ -1,8 +1,7 @@
-"""DAG orchestration with run-state persistence and resume.
+"""DAG orchestration with run-state persistence.
 
 The DAG class:
 - Builds a topological order from a list of NodeSpec instances
-- Optionally inherits state from a prior run.json (resume across invocations)
 - Runs each node in a fresh forked subprocess (memory isolation per node)
 - Writes run.json after each node
 - Marks status as "needs_continuation" if any node returns True (pagination)
@@ -24,10 +23,11 @@ Continuation pattern:
   the run is marked failed, and a human must investigate. Auto-retrigger
   on host kill would loop forever on a real OOM root cause.
 
-Resume pattern:
-- LOG_DIR/run.json exists from a prior invocation → load it
-- Topology hash matches → inherit "done" status for matching nodes
-- Topology hash differs → log warning, ignore prior state, run fresh
+Each main.py invocation is a fresh DAG run. Per-asset idempotency is the
+fetch fn's responsibility (raw_asset_exists + state). Cross-invocation
+inheritance of node statuses was removed — it caused log/run.json to claim
+nodes ran in this invocation when they hadn't, and the harness's on-disk
+probe disagreed with the orchestrator about where to find raw.
 """
 
 import hashlib
@@ -47,7 +47,9 @@ from pathlib import Path
 from typing import Callable
 
 from . import tracking
+from .io import record_completion, _load_state_raw
 from .spec import MaintainSpec, NodeSpec
+from .spec_hash import compute_spec_hash
 from .tracking import (
     IORecord,
     clear_tracking,
@@ -274,40 +276,49 @@ class DAG:
                 "materializations": [],
             }
 
-        # Try to inherit state from a prior run if LOG_DIR has a run.json
-        log_dir = os.environ.get("LOG_DIR")
-        if log_dir:
-            prior = _load_run_state(Path(log_dir))
-            if prior is not None:
-                self._inherit_from(prior)
+        # Each main.py invocation is a fresh DAG run. Cross-invocation resume
+        # was removed because it caused log/run.json to lie about which nodes
+        # actually ran THIS invocation — the harness probe and the orchestrator
+        # disagreed on where to find raw, and the agent saw phantom failures.
+        # Per-asset idempotency now flows through state's `_metadata.code_hash`
+        # rolled by record_completion after each successful run.
 
-    # =========================================================================
-    # Resume
-    # =========================================================================
-
-    def _inherit_from(self, prior: dict) -> None:
-        """Inherit done node states from a prior run.json (if topology matches)."""
-        prior_hash = prior.get("topology_hash")
-        if prior_hash and prior_hash != self.topology_hash:
-            print(
-                f"[DAG] Topology hash mismatch with prior run "
-                f"({prior_hash} vs {self.topology_hash}); starting fresh"
+        # Per-spec code hashes:
+        #   self._current_hashes[id]  — what THIS orchestrator computes for the
+        #                                spec right now; stamped into state on
+        #                                success. Audit-trail only — never
+        #                                drives a skip/run decision by itself.
+        #   self._expected_hashes     — what the harness expects (read from
+        #                                $HARNESS_EXPECTED_HASHES_FILE). Drives
+        #                                the bypass-maintain decision below.
+        #                                In prod the env var is unset → None →
+        #                                no bypass logic → behavior identical
+        #                                to today.
+        self._current_hashes: dict[str, str | None] = {}
+        for spec in specs:
+            try:
+                import inspect as _inspect
+                src_file = _inspect.getsourcefile(spec.fn)
+            except (TypeError, OSError):
+                src_file = None
+            if src_file:
+                fence = [Path(src_file).parents[1]] if Path(src_file).parents else []
+            else:
+                fence = []
+            self._current_hashes[spec.id] = compute_spec_hash(
+                src_file, getattr(spec.fn, "__name__", ""), list(spec.args),
+                fence_dirs=fence,
             )
-            return
 
-        prior_nodes = {n["id"]: n for n in prior.get("dag", {}).get("nodes", [])}
-        inherited = 0
-        for task_id, prior_state in prior_nodes.items():
-            if task_id in self.state and prior_state.get("status") == "done":
-                # Preserve "done" with all its tracking + timing data
-                self.state[task_id] = {
-                    **self.state[task_id],
-                    **prior_state,
-                    "resumed": True,
-                }
-                inherited += 1
-        if inherited:
-            print(f"[DAG] Resumed from prior invocation: {inherited} nodes already done")
+        hashes_file = os.environ.get("HARNESS_EXPECTED_HASHES_FILE")
+        self._expected_hashes: dict[str, str | None] | None = None
+        if hashes_file:
+            try:
+                self._expected_hashes = json.loads(Path(hashes_file).read_text())
+                print(f"[DAG] expected hashes loaded ({len(self._expected_hashes)} specs) from {hashes_file}")
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[DAG] WARN: failed to read {hashes_file}: {e} — proceeding without hash gate")
+                self._expected_hashes = None
 
     # =========================================================================
     # Topology
@@ -346,6 +357,13 @@ class DAG:
         raises is treated as "not fresh" and logged — never lose a fetch over
         a buggy maintain check.
 
+        Code-hash gate (dev-side activation only): when the harness writes
+        $HARNESS_EXPECTED_HASHES_FILE and a spec's stored `_metadata.code_hash`
+        on disk differs from the harness-expected hash, MaintainSpec is
+        bypassed entirely for that spec — it stays `pending` and will run.
+        In prod the env var is absent → this branch is no-op → behavior
+        matches today.
+
         Only operates on `pending` nodes; "done" from resume/DAG_TARGET is
         left alone (already-done is already-fresh by definition)."""
         force = os.environ.get("FORCE_REFRESH", "").strip().lower() in ("1", "true", "yes")
@@ -353,12 +371,30 @@ class DAG:
             print("[DAG] FORCE_REFRESH set — maintain skips bypassed")
             return
 
+        forced_by_hash = 0
         skipped = 0
         for spec in order:
+            if self.state[spec.id]["status"] != "pending":
+                continue
+
+            if self._expected_hashes is not None:
+                stored = None
+                try:
+                    raw = _load_state_raw(spec.id)
+                    meta = raw.get("_metadata") if isinstance(raw.get("_metadata"), dict) else None
+                    stored = meta.get("code_hash") if meta else None
+                except Exception:
+                    stored = None
+                expected = self._expected_hashes.get(spec.id)
+                if stored != expected:
+                    short_s = (stored or "")[:7] or "—"
+                    short_e = (expected or "")[:7] or "—"
+                    print(f"[DAG] {spec.id} forcing re-run (hash mismatch: {short_s}→{short_e})")
+                    forced_by_hash += 1
+                    continue  # leave pending; do NOT run maintain check
+
             maintain = self._maintain.get(spec.id)
             if maintain is None:
-                continue
-            if self.state[spec.id]["status"] != "pending":
                 continue
             try:
                 fresh = bool(maintain.check(spec.id))
@@ -378,6 +414,8 @@ class DAG:
         if skipped:
             self.save_state()
             print(f"[DAG] Maintain: {skipped} asset(s) skipped as fresh")
+        if forced_by_hash:
+            print(f"[DAG] Code-hash gate: {forced_by_hash} asset(s) forced to re-run")
 
     # =========================================================================
     # Execution
@@ -461,6 +499,19 @@ class DAG:
         elif result.get("needs_continuation"):
             task_state["needs_continuation"] = True
             self._needs_continuation = True
+
+        # Record completion: stamp `_metadata.code_hash` in the spec's state
+        # file with the hash this orchestrator computed at init. Audit record
+        # of "what code produced this state"; in dev the next harness run
+        # diffs against this. Only on success — failures preserve the prior
+        # state file unchanged. Runs even on needs_continuation (the spec
+        # made progress under this code).
+        if result["status"] == "done":
+            try:
+                record_completion(task_id, self._current_hashes.get(task_id))
+            except Exception as e:
+                # Don't let a state-write hiccup tank an otherwise successful node.
+                print(f"[DAG] WARN: record_completion failed for {task_id}: {type(e).__name__}: {e}")
 
         # Merge child's tracking snapshot into the supervisor's tracking module
         # so to_json() and _print_node_detail() see this node's I/O.
@@ -553,10 +604,31 @@ class DAG:
                     # No started_at/finished_at — these weren't run in this
                     # invocation; the timestamps document the run that did.
 
-        # Log resumed nodes upfront so output ordering matches prior behavior
+        # DAG_SKIP_DOWNLOAD=1 short-circuits all download-kind specs without
+        # spawning subprocesses. The reprocess flow: pin RUN_ID to a prior run
+        # whose raw is on disk, set DAG_SKIP_DOWNLOAD=1, and downstream specs
+        # (transform/curate/…) execute against the existing raw. Works with or
+        # without DAG_TARGET; when used alongside DAG_TARGET=transform the two
+        # flags are redundant but harmless (DAG_TARGET already marks downloads
+        # done via non-targeted handling above).
+        if os.environ.get("DAG_SKIP_DOWNLOAD", "").strip().lower() in ("1", "true", "yes"):
+            skip_count = 0
+            for sid, spec in self._specs.items():
+                if spec.kind == "download" and self.state[sid]["status"] == "pending":
+                    self.state[sid]["status"] = "done"
+                    self.state[sid]["error"] = None
+                    self.state[sid]["skipped_download"] = True
+                    skip_count += 1
+            if skip_count:
+                print(f"[DAG] DAG_SKIP_DOWNLOAD: marked {skip_count} download spec(s) as done (reprocess mode)")
+                self.save_state()
+
+        # Nodes already marked done at this point come from DAG_TARGET filtering
+        # (non-targeted kinds) or DAG_SKIP_DOWNLOAD. Log them so output ordering
+        # is consistent with subsequent run lines.
         for spec in order:
             if self.state[spec.id]["status"] == "done":
-                print(f"[DAG] {spec.id} resumed (done in prior invocation)")
+                print(f"[DAG] {spec.id} skipped (filtered)")
 
         # Maintain skips: evaluate per-asset freshness checks BEFORE any
         # subprocess spawn. A True result marks the NodeSpec done so dependents

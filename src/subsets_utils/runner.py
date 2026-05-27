@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 from .config import (
     is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name,
-    get_r2_prefix,
+    get_r2_prefix, get_r2_base,
 )
 from . import debug
 
@@ -491,6 +491,10 @@ def main():
         source = "R2" if is_cloud() else "local"
         print(f"  Resuming with prior run.json from {source}")
     print(f"Log directory: {log_dir}")
+    if is_cloud():
+        print(f"Raw scope:     s3://{get_bucket_name()}/{get_r2_base()}/runs/{run_id}/raw")
+    else:
+        print(f"Raw scope:     {get_data_dir()}/runs/{run_id}/raw")
     print("-" * 60)
 
     debug.log_run_start()

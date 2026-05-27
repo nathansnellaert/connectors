@@ -21,6 +21,7 @@ import io
 import json
 import gzip
 import hashlib
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -153,8 +154,9 @@ def load_asset(asset_name: str) -> pa.Table:
 # State files (small JSON, per-asset)
 # =============================================================================
 
-def load_state(asset: str) -> dict:
-    """Load state for an asset. Returns empty dict if not found."""
+def _load_state_raw(asset: str) -> dict:
+    """Load state including underscore-prefixed reserved keys (e.g. _metadata).
+    Internal: used by record_completion and save_state's merge path."""
     uri = state_uri(asset)
     data = _read_with_mirror_fallback(uri, mirror_state_path(asset))
     if not data:
@@ -162,20 +164,86 @@ def load_state(asset: str) -> dict:
     return json.loads(data.decode("utf-8"))
 
 
+def load_state(asset: str) -> dict:
+    """Load state for an asset. Returns empty dict if not found.
+
+    Reserved underscore-prefixed keys (e.g. `_metadata`) are stripped from
+    the returned dict — they are managed by the orchestrator, not by fetch
+    fns. This means the common load-modify-save pattern stays safe:
+
+        state = load_state(asset)
+        state["watermark"] = new_watermark
+        save_state(asset, state)
+
+    won't trip the reserved-prefix guard on save.
+    """
+    raw = _load_state_raw(asset)
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
 def save_state(asset: str, state_data: dict) -> str:
-    """Save state for an asset. Returns the URI."""
+    """Save state for an asset. Returns the URI.
+
+    Fetch-fn-managed state only. Underscore-prefixed keys are reserved for
+    the orchestrator (see `record_completion`) — passing one here raises.
+    Existing `_metadata` on disk (e.g. `code_hash` written post-success)
+    is preserved across this write; only `updated_at` and `run_id` get
+    refreshed each save.
+    """
     import os
-    old_state = load_state(asset)
-    state_data = {
+    for k in state_data:
+        if isinstance(k, str) and k.startswith("_"):
+            raise ValueError(
+                f"reserved key in save_state user dict: {k!r}. "
+                "Underscore-prefixed keys are managed by the orchestrator."
+            )
+
+    existing = _load_state_raw(asset)
+    existing_meta = existing.get("_metadata", {}) if isinstance(existing.get("_metadata"), dict) else {}
+
+    merged_meta = {
+        **existing_meta,
+        "updated_at": datetime.now().isoformat(),
+        "run_id": os.environ.get("RUN_ID", "unknown"),
+    }
+    payload = {
         **state_data,
-        "_metadata": {
-            "updated_at": datetime.now().isoformat(),
-            "run_id": os.environ.get("RUN_ID", "unknown"),
-        },
+        "_metadata": merged_meta,
     }
     uri = state_uri(asset)
-    _write_bytes(uri, json.dumps(state_data, indent=2).encode("utf-8"))
-    debug.log_state_change(asset, old_state, state_data)
+    _write_bytes(uri, json.dumps(payload, indent=2).encode("utf-8"))
+    debug.log_state_change(asset, existing, payload)
+    return uri
+
+
+def record_completion(asset: str, code_hash: str | None) -> str:
+    """Stamp `_metadata.code_hash` for `asset` after a successful materialization.
+
+    Called by the orchestrator post-success — not by fetch fns. Bypasses the
+    `save_state` reserved-prefix guard because it operates ENTIRELY under the
+    reserved namespace; fetch-fn-managed keys are preserved as-is.
+
+    A `None` hash means "compute failed; we don't know what produced this state"
+    and is recorded honestly rather than papering over it.
+    """
+    import os
+    existing = _load_state_raw(asset)
+    existing_meta = existing.get("_metadata", {}) if isinstance(existing.get("_metadata"), dict) else {}
+
+    merged_meta = {
+        **existing_meta,
+        "code_hash": code_hash,
+        "updated_at": datetime.now().isoformat(),
+        "run_id": os.environ.get("RUN_ID", "unknown"),
+    }
+    user_keys = {k: v for k, v in existing.items() if not (isinstance(k, str) and k.startswith("_"))}
+    payload = {
+        **user_keys,
+        "_metadata": merged_meta,
+    }
+    uri = state_uri(asset)
+    _write_bytes(uri, json.dumps(payload, indent=2).encode("utf-8"))
+    debug.log_state_change(asset, existing, payload)
     return uri
 
 
@@ -270,6 +338,76 @@ def load_raw_json(asset_id: str, *, entity_id: str | None = None):
     raise FileNotFoundError(f"Raw JSON asset '{asset_id}' not found.")
 
 
+# =============================================================================
+# Raw NDJSON (newline-delimited JSON, zstd-compressed by default)
+#
+# Use when records are heterogeneous, nested, or types drift across batches —
+# anything where declaring a parquet schema would be brittle. For tabular data
+# with stable column types, prefer save_raw_parquet.
+# =============================================================================
+
+_NDJSON_EXT = {"zstd": "ndjson.zst", "gzip": "ndjson.gz", None: "ndjson"}
+
+
+def save_raw_ndjson(rows, asset_id: str, *, compression: str | None = "zstd") -> str:
+    """Save records as NDJSON (one JSON object per line). Default: zstd.
+
+    For datasets that fit in memory. For larger ones use `raw_writer(asset,
+    "ndjson.gz", mode="wt", compression="gzip")` and stream line-by-line, or
+    the zstd equivalent if zstandard is available in the runtime.
+
+    Args:
+        rows: Iterable of JSON-serializable dicts.
+        asset_id: Logical asset name.
+        compression: "zstd" (default), "gzip", or None.
+    """
+    from .tracking import record_write
+    if compression not in _NDJSON_EXT:
+        raise ValueError(f"compression must be 'zstd', 'gzip', or None; got {compression!r}")
+    ext = _NDJSON_EXT[compression]
+
+    n = 0
+    if compression is None:
+        out = io.BytesIO()
+        for row in rows:
+            out.write(json.dumps(row, separators=(",", ":")).encode("utf-8"))
+            out.write(b"\n")
+            n += 1
+        content = out.getvalue()
+    else:
+        comp_buf = pa.BufferOutputStream()
+        with pa.CompressedOutputStream(comp_buf, compression=compression) as out:
+            for row in rows:
+                out.write(json.dumps(row, separators=(",", ":")).encode("utf-8"))
+                out.write(b"\n")
+                n += 1
+        content = comp_buf.getvalue().to_pybytes()
+
+    uri = raw_uri(asset_id, ext)
+    _write_bytes(uri, content)
+    print(f"  -> Saved {asset_id}.{ext} ({n:,} records)")
+    record_write(f"raw/{asset_id}.{ext}")
+    return uri
+
+
+def load_raw_ndjson(asset_id: str) -> list[dict]:
+    """Load NDJSON records. Auto-detects compression by trying .zst, .gz, then plain."""
+    from .tracking import record_read
+    for compression, ext in (("zstd", "ndjson.zst"), ("gzip", "ndjson.gz"), (None, "ndjson")):
+        uri = raw_uri(asset_id, ext)
+        data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, ext))
+        if data is None:
+            continue
+        record_read(f"raw/{asset_id}.{ext}")
+        if compression is None:
+            text = data.decode("utf-8")
+        else:
+            stream = pa.CompressedInputStream(pa.BufferReader(pa.py_buffer(data)), compression=compression)
+            text = stream.read().decode("utf-8")
+        return [json.loads(line) for line in text.splitlines() if line]
+    raise FileNotFoundError(f"Raw NDJSON asset '{asset_id}' not found.")
+
+
 def delete_raw_file(asset_id: str, extension: str = "parquet", *, entity_id: str | None = None) -> None:
     """Delete a raw asset by (asset_id, extension). No-op if absent.
 
@@ -288,7 +426,7 @@ def save_raw_parquet(data: pa.Table, asset_id: str) -> str:
     if hasattr(data, "read_all"):
         data = data.read_all()
     buf = io.BytesIO()
-    pq.write_table(data, buf, compression="snappy")
+    pq.write_table(data, buf, compression="zstd")
     uri = raw_uri(asset_id, "parquet")
     _write_bytes(uri, buf.getvalue())
     print(f"  -> Saved {asset_id}.parquet ({data.num_rows:,} rows)")
@@ -445,7 +583,7 @@ def raw_reader(
 
 
 @contextmanager
-def raw_parquet_writer(asset_id: str, schema: pa.Schema, *, compression: str = "snappy"):
+def raw_parquet_writer(asset_id: str, schema: pa.Schema, *, compression: str = "zstd"):
     """Streaming Parquet writer yielding a `pq.ParquetWriter`.
 
     Bounded memory for arbitrarily large datasets — call `write_table()`
