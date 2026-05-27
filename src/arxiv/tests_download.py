@@ -8,24 +8,31 @@ file-existence check would miss.
 """
 from subsets_utils import list_raw_files, load_raw_ndjson
 
+_BATCH_GLOB = "arxiv-papers-*.ndjson*"
 
-def _load_all_papers() -> list[dict]:
-    rows: list[dict] = []
-    for path in list_raw_files(prefix="arxiv-papers-"):
-        # list_raw_files returns asset paths; strip dir + extension to the id.
+
+def _batch_asset_ids() -> list[str]:
+    ids = []
+    for path in list_raw_files(_BATCH_GLOB):
         asset = path.split("/")[-1]
         for ext in (".ndjson.zst", ".ndjson.gz", ".ndjson"):
             if asset.endswith(ext):
                 asset = asset[: -len(ext)]
                 break
+        ids.append(asset)
+    return ids
+
+
+def _load_all_papers() -> list[dict]:
+    rows: list[dict] = []
+    for asset in _batch_asset_ids():
         rows.extend(load_raw_ndjson(asset))
     return rows
 
 
 def test_papers_batches_exist_and_nonempty():
     """At least one batch file with rows. Empty harvest => endpoint/format broke."""
-    files = list_raw_files(prefix="arxiv-papers-")
-    assert files, "no arxiv-papers-* raw batch files were written"
+    assert _batch_asset_ids(), "no arxiv-papers-* raw batch files were written"
     rows = _load_all_papers()
     # A single bounded run harvests at least the first window (2005-09-17 alone
     # is ~94k records); be conservative against partial first windows.
