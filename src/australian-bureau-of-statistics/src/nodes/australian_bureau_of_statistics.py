@@ -68,6 +68,27 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _ensure_r2_fixed_upload_size() -> None:
+    """Make s3fs use equal-sized multipart parts when streaming to R2.
+
+    Cloudflare R2 rejects a multipart upload whose non-final parts differ in
+    size ("[Errno 22] All non-trailing parts must have the same length"), and
+    s3fs only guarantees uniform parts when its filesystem is created with
+    `fixed_upload_size=True` — which subsets_utils' `get_fs` does not set. The
+    big dataflows here (e.g. C21_G09_SAL, ~24M rows) write a multi-part parquet
+    straight to R2 and fail without this. fsspec caches the s3fs instance keyed
+    on its kwargs, and `get_fs` always builds it with the same kwargs, so
+    flipping the attribute on the cached instance fixes the writer that
+    `raw_parquet_writer` opens. Cloud-only; a harmless no-op in local dev where
+    `get_fs` returns a local filesystem.
+    """
+    from subsets_utils.config import is_cloud, get_fs
+
+    if not is_cloud():
+        return
+    get_fs("s3://").fixed_upload_size = True
+
+
 class _StreamReader:
     """Minimal read(size) file-like over an httpx streaming byte iterator.
 
@@ -142,6 +163,7 @@ def _stream_dataflow_to_parquet(dataflow_id: str, asset_id: str) -> int:
     be fetchable, so a genuine gap should fail loudly rather than be skipped.
     """
     url = f"{BASE_URL}/data/{dataflow_id}/all"
+    _ensure_r2_fixed_upload_size()
     client = get_client()
     rows = 0
     with client.stream(

@@ -8,7 +8,8 @@ of SDMX code columns, and mass truncation of the high-signal series.
 
 import pyarrow.parquet as pq
 
-from subsets_utils import load_raw_parquet, raw_parquet_localpath
+from subsets_utils import load_raw_parquet
+from subsets_utils.config import raw_uri, get_fs
 
 # Required SDMX-CSV columns present on every ABS dataflow.
 _REQUIRED_COLS = {"DATAFLOW", "TIME_PERIOD", "OBS_VALUE"}
@@ -23,11 +24,16 @@ _FLOORS = {
 
 
 def _row_count(spec_id: str) -> int:
-    """Row count from the parquet footer — no full data load (some assets are
-    millions of rows). raw_parquet_localpath resolves to a real path in dev and
-    a streamed tempfile in cloud, so this stays memory-bounded either way."""
-    with raw_parquet_localpath(spec_id) as path:
-        return pq.ParquetFile(path).metadata.num_rows
+    """Row count from the parquet footer only — no full data transfer.
+
+    Opens the asset through the same R2-aware fsspec layer the loaders use
+    (`raw_uri` + `get_fs`); pyarrow reads just the footer via ranged GETs, so
+    this stays cheap across all 761 assets even when some are tens of millions
+    of rows. Local in dev, s3:// (R2) in cloud — never touches a raw path
+    directly."""
+    uri = raw_uri(spec_id, "parquet")
+    with get_fs(uri).open(uri, "rb") as f:
+        return pq.ParquetFile(f).metadata.num_rows
 
 
 def test_every_asset_nonempty(spec_ids):
