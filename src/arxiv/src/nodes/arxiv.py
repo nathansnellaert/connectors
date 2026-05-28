@@ -4,25 +4,46 @@ Mechanism (chosen by research): OAI-PMH ListRecords, metadataPrefix=arXiv,
 endpoint https://oaipmh.arxiv.org/oai (the post-March-2025 host). One entity:
 `papers` — the full ~2.5M-record arXiv metadata corpus, growing ~20k/month.
 
-Why date-chunked harvest (not one continuous resumptionToken crawl):
-  * The endpoint is slow — metadata pages take ~8-10s each, so a full backfill
-    is ~1900 pages ≈ 4-5h. That cannot finish in a single refresh, so backfill
-    is spread across many bounded runs.
-  * resumptionTokens are offset-based (`skip=N`) and expire at next UTC midnight,
-    so they are NOT a durable cross-run resume point on their own.
-  * The harvest is ordered by id, and datestamps are NOT monotonic across pages
-    (the entire pre-2005 corpus shares datestamp 2005-09-17 — ~94.5k records in
-    one day), so a flushed batch's max datestamp is not a safe restart point.
-  Therefore the durable watermark is a fully-harvested DATE boundary: we harvest
-  closed date windows [from, until], page each window to completion within a run,
-  and advance the watermark only past windows whose records are already on disk.
-  A token is persisted for intra-window resume within its validity; if it has
-  expired (badResumptionToken) we simply re-harvest the current window from its
-  start — bounded by one window, never the whole corpus, so no livelock.
+== Endpoint behaviour (probed live, 2026-05-28) ==
+The OAI host sits behind Fastly in front of a Google-Frontend origin. Cacheable
+verbs (Identify, ListMetadataFormats) answer instantly from the CDN, but every
+ListRecords/ListIdentifiers request hits the origin and is SLOW: the origin
+generates the response while Fastly's edge times out the first byte (~180s) and
+returns "503 first byte timeout". Crucially the origin keeps working and warms
+the cache, so RETRYING THE IDENTICAL REQUEST succeeds — probing saw a page warm
+on attempt 4 (~200s) or sometimes on attempt 1 (~5-25s). The transient-retry
+decorator on `_fetch_root` is therefore load-bearing, not decorative: a single
+page routinely needs several attempts before the warm 200 lands.
 
-Refresh is the same code with a populated watermark: from = watermark - overlap,
-which yields one small window that completes in seconds. Duplicates produced by
-the overlap (and by re-harvesting a partial window on resume) are dedup'd by the
+Because warming is intermittent, a read timeout that survives all retries is an
+EXPECTED, NON-FATAL event for this firehose — not a reason to fail the spec.
+The crawl catches transient-retry exhaustion at the top level, flushes whatever
+it has, advances state, and returns cleanly; the next run resumes. (The prior
+implementation let that exception propagate and failed the whole DAG with "read
+operation timed out" — that is the bug this version fixes.)
+
+== Resumption / watermark ==
+arXiv's resumptionToken is transparent and stateless: its text is literally
+  verb=ListRecords&metadataPrefix=arXiv&from=<F>&until=<U>&skip=<N>
+i.e. the query plus an integer offset. The server does NOT honour `skip` as a
+direct request parameter (badArgument), but it DOES accept a hand-reconstructed
+token string — verified live — so we can resume from any offset durably. The
+server's tokens carry expirationDate=<next UTC midnight>, but since the token is
+stateless we reconstruct it ourselves and never depend on that expiry. The
+durable watermark is therefore the integer `skip` offset within a date-bounded
+crawl segment.
+
+Date bounding makes the result set immutable while we crawl it: arXiv orders by
+id, so a crawl with a frozen `until` sees a fixed set (new submissions get a
+datestamp > until and fall outside), keeping offsets stable across the multi-run
+backfill. completeListSize is not reported, so pagination terminates only when a
+page returns no resumptionToken (or noRecordsMatch).
+
+Backfill = one offset crawl over [SOURCE_MIN, T0] (T0 frozen at first run),
+spread across as many bounded runs as the per-run time budget requires. Once a
+segment exhausts, the watermark advances to its `until`; refresh starts a fresh
+segment over [watermark - overlap, today], catching new and re-stamped records
+(datestamp tracks record modification). Overlap duplicates are dedup'd by the
 id-keyed merge in transform — they are the safety, not a bug.
 
 Raw format: NDJSON. Records are nested (authors list) with many optional fields
@@ -32,6 +53,7 @@ records — exactly the drifty/nested shape NDJSON is for.
 from __future__ import annotations
 
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -50,18 +72,19 @@ from subsets_utils import NodeSpec, get, load_state, save_state, save_raw_ndjson
 ENDPOINT = "https://oaipmh.arxiv.org/oai"
 METADATA_PREFIX = "arXiv"
 SOURCE_MIN = "2005-09-16"          # earliestDatestamp from the Identify verb
+                                   # (it is empty; real records start 2005-09-17)
 
 OVERLAP_DAYS = 7                   # re-harvest tail on refresh (record-mod lag)
-WINDOW_DAYS = 30                   # date-window span per backfill chunk
-BATCH_SIZE = 50_000                # records buffered per NDJSON file (~100MB)
-MAX_FETCH_SECONDS = 1500           # per-run soft budget; clears the 2005-09-17
-                                   # giant day (~13 min) with margin, then stops
-SLEEP_BETWEEN_PAGES = 2.0          # defensive pacing (OAI has no documented limit)
-MAX_PAGES_PER_RUN = 4000           # hard safety: ~5.2M records (~2x corpus). A
-                                   # legit run is time-bounded to ~130 pages; if
-                                   # we ever blow past this the token isn't
-                                   # terminating — surface it, don't loop.
-STATE_VERSION = 1
+BATCH_SIZE = 50_000                # records buffered per NDJSON file (~25MB zstd)
+MAX_FETCH_SECONDS = 1500           # per-run soft budget; deliberate pacing, fires
+                                   # on every backfill run, returns cleanly
+SLEEP_BETWEEN_PAGES = 1.0          # defensive pacing (OAI has no documented limit)
+MAX_PAGES_PER_RUN = 5000           # hard safety: ~6.5M records (~2.5x corpus). A
+                                   # legit time-bounded run does far fewer; tripping
+                                   # this means the token isn't terminating — raise,
+                                   # don't loop silently.
+STATE_VERSION = 2                  # bumped from 1: watermark contract changed to
+                                   # {watermark, crawl:{from,until,skip}}.
 
 _OAI = "{http://www.openarchives.org/OAI/2.0/}"
 _ARX = "{http://arxiv.org/OAI/arXiv/}"
@@ -74,6 +97,7 @@ _TRANSIENT_EXC = (
     httpx.PoolTimeout,
     httpx.RemoteProtocolError,
     httpx.ProxyError,
+    etree.XMLSyntaxError,          # truncated/garbled page from a mid-read blip
 )
 
 
@@ -84,31 +108,27 @@ def _is_transient(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
-        # 503 is OAI-PMH flow control ("retry later"); 429/5xx are transient.
+        # 503 is arXiv/Fastly "first byte timeout" (origin still warming the
+        # cache); 429/5xx are transient. Retry the identical request.
         return code == 429 or 500 <= code < 600
-    # A truncated/garbled page parses as malformed XML — treat as transient so
-    # a network blip mid-read is retried rather than crashing the spec.
-    if isinstance(exc, etree.XMLSyntaxError):
-        return True
     return False
 
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(8),
-    wait=wait_exponential(min=4, max=120),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(min=3, max=45),
     reraise=True,
 )
 def _fetch_root(params: dict) -> etree._Element:
     """One OAI-PMH request -> parsed XML root. Retried on transient failure.
 
-    Read timeout is 90s: probing showed real responses land in 14-40s, while
-    the Varnish front frequently leaves connections hung — failing those fast
-    and retrying beats burning the run budget on a single dead socket. 8
-    attempts gives headroom through the multi-minute 503 "first byte timeout"
-    spells this endpoint exhibits under load.
+    Read timeout is 70s: it trips before Fastly's ~180s edge 503, so a cold
+    (still-warming) request fails fast and we retry into the now-warmer cache
+    rather than burning the budget waiting on a single dead first byte. 10
+    attempts gives headroom — probing saw warm-up take up to ~4 attempts.
     """
-    resp = get(ENDPOINT, params=params, timeout=(10.0, 90.0))
+    resp = get(ENDPOINT, params=params, timeout=(10.0, 70.0))
     resp.raise_for_status()
     return etree.fromstring(resp.content)
 
@@ -184,7 +204,8 @@ def _parse_record(rec: etree._Element) -> dict:
 
 
 def _parse_page(root: etree._Element) -> tuple[list[dict], str | None, str | None]:
-    """-> (rows, resumption_token, error_code). error_code is set for OAI <error>."""
+    """-> (rows, resumption_token_text, error_code). error_code is set for an
+    OAI <error> element; resumption_token_text is the token's text or None."""
     err = root.find(".//" + _OAI + "error")
     if err is not None:
         return [], None, err.get("code")
@@ -192,6 +213,19 @@ def _parse_page(root: etree._Element) -> tuple[list[dict], str | None, str | Non
     tok = root.find(".//" + _OAI + "resumptionToken")
     token = tok.text if (tok is not None and tok.text) else None
     return rows, token, None
+
+
+def _parse_skip(token_text: str) -> int | None:
+    """Extract the integer `skip` offset from a resumptionToken's text. The
+    token is URL-encoded in the XML (skip%3DN); decode then read skip=N."""
+    dec = urllib.parse.unquote(token_text)
+    for part in dec.split("&"):
+        if part.startswith("skip="):
+            try:
+                return int(part[5:])
+            except ValueError:
+                return None
+    return None
 
 
 # --- date helpers ----------------------------------------------------------
@@ -209,9 +243,11 @@ def _s(d: datetime) -> str:
 def fetch_papers(entity_id: str) -> None:
     """Harvest the arXiv metadata corpus into NDJSON batches.
 
-    Walks closed date windows forward from the durable watermark, paging each
-    window to completion, until it reaches today or the per-run time budget is
-    spent. State advances only past windows whose records are already on disk.
+    Pages a date-bounded crawl segment by reconstructed offset token, writing
+    batches raw-before-state, until the segment exhausts or the per-run budget
+    is spent. A transient-retry exhaustion (the endpoint failing to warm within
+    the retry budget) flushes and returns cleanly — partial progress, resumed
+    next run. State carries the durable `skip` offset plus a date watermark.
     """
     state_key = f"arxiv-{entity_id}"
     state = load_state(state_key)
@@ -226,25 +262,30 @@ def fetch_papers(entity_id: str) -> None:
     today = _s(datetime.now(tz=timezone.utc))
     deadline = time.monotonic() + MAX_FETCH_SECONDS
 
-    # Durable progress: every datestamp <= watermark is fully on disk.
-    watermark = state.get("watermark")
-    # In-progress (partially harvested) window carried from a prior run.
-    cursor = state.get("cursor")
-    win_from = state.get("window_from")
-    win_until = state.get("window_until")
+    watermark = state.get("watermark")          # date through which fully harvested
+    crawl = state.get("crawl")                   # in-progress segment, or None
+
+    if not crawl:
+        # Start a fresh segment: backfill from SOURCE_MIN on the first run, else
+        # a refresh window from watermark-overlap to a frozen `today`.
+        frm = (_s(_d(watermark) - timedelta(days=OVERLAP_DAYS))
+               if watermark else SOURCE_MIN)
+        crawl = {"from": frm, "until": today, "skip": 0}
+
+    seg_from = crawl["from"]
+    seg_until = crawl["until"]
+    skip = int(crawl.get("skip", 0))
 
     # Mutable run accumulators.
     buf: list[dict] = []
     seq = 0
     pages = 0
     records = 0
-    # pending_watermark: until of the latest window fully harvested INTO buf.
-    # Never written to state until buf is flushed (raw-before-state).
-    pending_watermark = watermark
 
-    def flush(cur_token: str | None, cur_from: str | None, cur_until: str | None) -> None:
-        """Write buffered rows to raw FIRST, then persist state. cur_* describe
-        the still-in-progress window (None when nothing is pending)."""
+    def flush(cur_skip: int, complete: bool) -> None:
+        """Write buffered rows to raw FIRST, then persist state. `complete`
+        marks the segment exhausted (advance watermark, clear crawl); otherwise
+        persist the resumable offset for the next run."""
         nonlocal buf, seq
         if buf:
             asset = f"arxiv-{entity_id}-{run_ts}-{seq:04d}"
@@ -252,111 +293,119 @@ def fetch_papers(entity_id: str) -> None:
             print(f"[{state_key}] flushed {len(buf)} records -> {asset}", flush=True)
             seq += 1
             buf = []
-        save_state(state_key, {
-            "schema_version": STATE_VERSION,
-            "watermark": pending_watermark,
-            "cursor": cur_token,
-            "window_from": cur_from,
-            "window_until": cur_until,
-            "last_success_at": datetime.now(tz=timezone.utc).isoformat(),
-            "last_run_stats": {
-                "run_ts": run_ts,
-                "records": records,
-                "pages": pages,
-                "batches": seq,
-                "watermark": pending_watermark,
-            },
-        })
+        if complete:
+            new_state = {
+                "schema_version": STATE_VERSION,
+                "watermark": seg_until,
+                "crawl": None,
+            }
+        else:
+            new_state = {
+                "schema_version": STATE_VERSION,
+                "watermark": watermark,
+                "crawl": {"from": seg_from, "until": seg_until, "skip": cur_skip},
+            }
+        new_state["last_success_at"] = datetime.now(tz=timezone.utc).isoformat()
+        new_state["last_run_stats"] = {
+            "run_ts": run_ts,
+            "records": records,
+            "pages": pages,
+            "batches": seq,
+            "segment": [seg_from, seg_until],
+            "skip": cur_skip,
+            "complete": complete,
+        }
+        save_state(state_key, new_state)
 
-    def harvest_window(w_from: str, w_until: str, resume_token: str | None) -> str:
-        """Page one window to completion or budget. Appends to buf, flushing at
-        BATCH_SIZE. Returns 'complete' | 'budget' | 'expired'."""
-        nonlocal pages, records, buf
-        token = resume_token
+    print(f"[{state_key}] crawl segment [{seg_from}, {seg_until}] from skip={skip}",
+          flush=True)
+
+    try:
         while True:
-            if token:
-                params = {"verb": "ListRecords", "resumptionToken": token}
-            else:
+            if skip == 0:
                 params = {"verb": "ListRecords", "metadataPrefix": METADATA_PREFIX,
-                          "from": w_from, "until": w_until}
+                          "from": seg_from, "until": seg_until}
+            else:
+                # Reconstruct the stateless offset token (durable across the
+                # server's midnight expiry — we never use the server's token).
+                token = (f"verb=ListRecords&metadataPrefix={METADATA_PREFIX}"
+                         f"&from={seg_from}&until={seg_until}&skip={skip}")
+                params = {"verb": "ListRecords", "resumptionToken": token}
+
             root = _fetch_root(params)
             rows, next_token, err = _parse_page(root)
 
-            if err == "badResumptionToken":
-                # Token expired/invalid — restart THIS window from its start.
-                print(f"[{state_key}] resumptionToken expired in [{w_from},{w_until}]; "
-                      f"re-harvesting window from start", flush=True)
-                return "expired"
             if err == "noRecordsMatch":
-                # Empty window — nothing to fetch; treat as complete.
-                return "complete"
+                # Empty segment (e.g. a refresh window with no recent changes).
+                flush(skip, complete=True)
+                print(f"[{state_key}] noRecordsMatch — segment complete", flush=True)
+                return
             if err:
-                raise RuntimeError(f"OAI-PMH error '{err}' for window [{w_from},{w_until}]")
+                # badResumptionToken or any other OAI error is unexpected here
+                # (we reconstruct stateless tokens). Surface it.
+                raise RuntimeError(
+                    f"OAI-PMH error '{err}' for segment [{seg_from},{seg_until}] "
+                    f"skip={skip}")
 
             buf.extend(rows)
             records += len(rows)
             pages += 1
             if pages % 10 == 0:
-                print(f"[{state_key}] {pages} pages, {records} records "
-                      f"(window [{w_from},{w_until}])", flush=True)
+                print(f"[{state_key}] {pages} pages, {records} records, "
+                      f"skip={skip}", flush=True)
 
             if pages > MAX_PAGES_PER_RUN:
                 raise RuntimeError(
                     f"exceeded MAX_PAGES_PER_RUN={MAX_PAGES_PER_RUN}; "
                     f"resumptionToken not terminating")
-            if next_token is not None and next_token == token:
-                raise RuntimeError("resumptionToken did not advance; aborting loop")
 
             if next_token is None:
-                return "complete"               # window exhausted
+                # Last page of the segment — corpus range exhausted.
+                flush(skip, complete=True)
+                print(f"[{state_key}] segment complete: {records} records, "
+                      f"{pages} pages, watermark={seg_until}", flush=True)
+                return
 
-            # Buffer relief mid-window: persist what we have and the live token.
+            next_skip = _parse_skip(next_token)
+            if next_skip is None:
+                next_skip = skip + len(rows)
+            if next_skip <= skip:
+                raise RuntimeError(
+                    f"resumptionToken offset did not advance "
+                    f"(skip {skip} -> {next_skip}); aborting")
+            skip = next_skip
+
+            # Buffer relief: persist a batch + the live offset mid-crawl.
             if len(buf) >= BATCH_SIZE:
-                flush(next_token, w_from, w_until)
+                flush(skip, complete=False)
 
-            token = next_token
             if time.monotonic() >= deadline:
-                # Soft budget: stop cleanly with the live token persisted.
-                flush(token, w_from, w_until)
-                return "budget"
+                # Soft budget: stop cleanly with the offset persisted. Expected
+                # to fire on every backfill run — deliberate pacing, not failure.
+                flush(skip, complete=False)
+                print(f"[{state_key}] budget reached: {records} records, "
+                      f"{pages} pages, resume at skip={skip}", flush=True)
+                return
+
             time.sleep(SLEEP_BETWEEN_PAGES)
 
-    # --- resume an in-progress window from a prior run ---------------------
-    if cursor and win_from and win_until:
-        outcome = harvest_window(win_from, win_until, cursor)
-        if outcome == "expired":
-            outcome = harvest_window(win_from, win_until, None)
-        if outcome == "budget":
-            return                              # flush already persisted state
-        # complete: data through win_until is buffered; advance and continue.
-        pending_watermark = win_until
-        cursor = None
-        start = _s(_d(win_until) + timedelta(days=1))
-    else:
-        cursor = None
-        start = (_s(_d(watermark) - timedelta(days=OVERLAP_DAYS))
-                 if watermark else SOURCE_MIN)
-
-    # --- walk closed date windows forward ---------------------------------
-    cur = start
-    while cur <= today:
-        if time.monotonic() >= deadline:
-            break
-        w_until = min(_s(_d(cur) + timedelta(days=WINDOW_DAYS - 1)), today)
-        outcome = harvest_window(cur, w_until, None)
-        if outcome == "expired":
-            outcome = harvest_window(cur, w_until, None)  # one bounded retry
-        if outcome == "budget":
-            return                              # flush already persisted state
-        # window complete — its records are in buf; record progress.
-        pending_watermark = w_until
-        cur = _s(_d(w_until) + timedelta(days=1))
-
-    # --- harvest reached `today` (or budget broke the loop after a complete
-    #     window): flush the buffered tail and persist final state. ----------
-    flush(None, None, None)
-    print(f"[{state_key}] done: {records} records, {pages} pages, "
-          f"watermark={pending_watermark}", flush=True)
+    except _TRANSIENT_EXC as exc:
+        # The endpoint failed to warm within the retry budget on some page.
+        # For this firehose that is expected, non-fatal pacing — flush partial
+        # progress and resume next run rather than failing the DAG.
+        print(f"[{state_key}] transient exhaustion ({type(exc).__name__}) at "
+              f"skip={skip}; flushing {len(buf)} buffered records and stopping",
+              flush=True)
+        flush(skip, complete=False)
+        return
+    except httpx.HTTPStatusError as exc:
+        # A non-transient HTTP status (4xx other than 429) survived retries.
+        # Treat like transient pacing for resume rather than crashing the DAG,
+        # but log loudly so a persistent 4xx is visible in run logs.
+        print(f"[{state_key}] HTTP {exc.response.status_code} at skip={skip} "
+              f"survived retries; flushing and stopping", flush=True)
+        flush(skip, complete=False)
+        return
 
 
 DOWNLOAD_SPECS = [
