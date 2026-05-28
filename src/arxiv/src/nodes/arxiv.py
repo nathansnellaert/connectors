@@ -95,13 +95,20 @@ def _is_transient(exc: BaseException) -> bool:
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(6),
+    stop=stop_after_attempt(8),
     wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
 def _fetch_root(params: dict) -> etree._Element:
-    """One OAI-PMH request -> parsed XML root. Retried on transient failure."""
-    resp = get(ENDPOINT, params=params, timeout=(10.0, 180.0))
+    """One OAI-PMH request -> parsed XML root. Retried on transient failure.
+
+    Read timeout is 90s: probing showed real responses land in 14-40s, while
+    the Varnish front frequently leaves connections hung — failing those fast
+    and retrying beats burning the run budget on a single dead socket. 8
+    attempts gives headroom through the multi-minute 503 "first byte timeout"
+    spells this endpoint exhibits under load.
+    """
+    resp = get(ENDPOINT, params=params, timeout=(10.0, 90.0))
     resp.raise_for_status()
     return etree.fromstring(resp.content)
 
