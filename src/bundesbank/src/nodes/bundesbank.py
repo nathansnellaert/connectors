@@ -9,9 +9,12 @@ For each of the 86 publishable dataflows we issue ONE request:
 and persist the returned ZIP verbatim.
 
 Why the ZIP content type rather than `?format=csv`: the plain Bundesbank-CSV
-surface enforces a 200-series ceiling and returns HTTP 406 for any real
-dataflow ("Csv time series limit of 200 exceeded. Request same time series
-with content type application/vnd.bbk.data+csv-zip..."). The SDMX-CSV
+surface refuses whole-dataflow requests — depending on the flow it returns
+HTTP 400 ("Cannot generate CSV of time series with mixed frequencies", e.g.
+BBSIS which mixes A/D/M members) or HTTP 406 (the 200-series ceiling, "Csv
+time series limit of 200 exceeded. Request ... with content type
+application/vnd.bbk.data+csv-zip..."). Either way the plain CSV surface is a
+dead end for a per-dataflow snapshot. The SDMX-CSV
 whole-dataflow surface works but is enormous uncompressed (BBEX3 alone is
 ~2.3 GB of text). The ZIP variant is the only path that returns the *entire*
 dataflow in one bounded, compressed payload. Probed sizes: most flows are tens
