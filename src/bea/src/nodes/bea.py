@@ -33,10 +33,11 @@ Year="ALL"). These were verified live 2026-05-30:
                     pin one TypeOfService per call with TradeDirection/
                     Affiliation/AreaOrCountry="All", Year="ALL"; verified live:
                     one service returns ~4.9k rows).
-  - loop_param_freq: one GetData per (param value, frequency) (IIP — GetData
-                    rejects TypeOfInvestment=All together with Year=ALL
-                    ["exactly one TypeOfInvestment OR one Year"], so pin one
-                    TypeOfInvestment with Year=ALL; verified -> 188 rows/call).
+  - loop_year     : one GetData per Year, all frequencies in one call (IIP —
+                    GetData rejects TypeOfInvestment=All together with Year=ALL
+                    ["exactly one TypeOfInvestment OR one Year"], so pin Year and
+                    keep TypeOfInvestment/Component all-valued; verified Year=2024
+                    -> 5161 rows; ~50 years).
   - loop_area     : one GetData per AreaOrCountry value (ITA — API forbids ALL
                     Indicator + ALL AreaOrCountry together).
   - mne           : DirectionOfInvestment x Classification x Year. MNE GetData
@@ -182,14 +183,16 @@ DATASET_STRATEGY = {
         # IIP GetData rejects TypeOfInvestment=All together with Year=ALL:
         # "Either exactly one TypeOfInvestment must be requested or exactly one
         # Year must be requested" (verified live — this killed all 3 prior
-        # calls). So pin one TypeOfInvestment per call and keep Year=ALL.
-        # Verified: TypeOfInvestment=CurrAndDepAssets + Component=All +
-        # Frequency=A + Year=ALL returned 188 rows. TypeOfInvestment has ~399
-        # values; looped across the 3 frequencies that is the full corpus.
-        "mode": "loop_param_freq",
-        "param": "TypeOfInvestment",
-        "base": {"Component": "All", "Year": "ALL"},
-        "freqs": ["A", "QNSA", "QSA"],
+        # calls). Satisfy the rule by pinning one Year per call and keeping
+        # TypeOfInvestment=All/Component=All, with all frequencies in one
+        # request. Verified live: Year=2024 + TypeOfInvestment=All +
+        # Component=All + Frequency=A,QNSA,QSA -> 5161 rows. IIP exposes ~50
+        # years, so this is ~50 calls — far cheaper than looping the 399
+        # TypeOfInvestment values (which also works, 188 rows/call, but is 1197
+        # calls).
+        "mode": "loop_year",
+        "base": {"TypeOfInvestment": "All", "Component": "All"},
+        "freq": "A,QNSA,QSA",
     },
     "ITA": {
         "mode": "loop_area",
@@ -388,17 +391,14 @@ def _plan_calls(dataset: str, strat: dict) -> list[dict]:
             {**strat["base"], param: code}
             for code in _param_codes(dataset, param)
         ]
-    if mode == "loop_param_freq":
-        # One GetData per (param value, frequency): used when the API forbids an
-        # all-valued param alongside Year=ALL (IIP), so we pin the param and keep
-        # Year=ALL, sweeping each frequency.
-        param = strat["param"]
-        freqs = strat["freqs"]
-        calls = []
-        for code in _param_codes(dataset, param):
-            for f in freqs:
-                calls.append({**strat["base"], param: code, "Frequency": f})
-        return calls
+    if mode == "loop_year":
+        # One GetData per Year (all frequencies in a single call), used when the
+        # API forbids an all-valued param alongside Year=ALL (IIP): pin Year and
+        # keep the other params all-valued.
+        return [
+            {**strat["base"], "Year": y, "Frequency": strat["freq"]}
+            for y in _param_codes(dataset, "Year")
+        ]
     if mode == "loop_tableid_gdp":
         # GDPbyIndustry-family per-table sweep: one GetData per (TableID, freq)
         # with Industry=ALL/Year=ALL, used when the all-tables request is too big
