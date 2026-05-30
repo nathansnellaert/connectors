@@ -111,6 +111,10 @@ def _crawl_drf(url: str) -> list[dict]:
             expected = data.get("count")
         rows.extend(data["results"])
         next_url = data.get("next")
+        # DRF echoes the `next` link as http://; force https so we never make a
+        # plain-HTTP hop (the server would redirect anyway).
+        if next_url and next_url.startswith("http://"):
+            next_url = "https://" + next_url[len("http://"):]
         if pages % 10 == 0:
             print(f"{url}: page {pages}, {len(rows)} rows so far", flush=True)
     if expected is not None and len(rows) != expected:
