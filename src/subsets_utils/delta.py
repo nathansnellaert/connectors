@@ -20,7 +20,6 @@ except ImportError:
 
 from .config import get_data_dir, is_cloud, get_storage_options, subsets_uri
 from . import debug
-from .io import data_hash
 from .tracking import record_write
 
 
@@ -72,104 +71,6 @@ class WriteResult:
     rows: int
 
 
-def validate_asset(
-    name: str,
-    *,
-    key: Union[str, list[str]] = None,
-    expected_columns: list[str] = None
-) -> dict:
-    """Validate an existing Delta table asset.
-
-    Returns a report with:
-    - row_count: number of rows
-    - columns: list of columns
-    - key_duplicates: number of duplicate key combinations (if key provided)
-    - key_nulls: nulls per key column (if key provided)
-    - needs_cleanup: True if issues found
-
-    Args:
-        name: Dataset name
-        key: Expected key column(s) for uniqueness check
-        expected_columns: Columns that should exist
-
-    Returns:
-        Validation report dict
-
-    Raises:
-        FileNotFoundError: If asset doesn't exist
-    """
-    uri = _get_uri(name)
-    opts = _get_opts()
-
-    try:
-        dt = DeltaTable(uri, storage_options=opts)
-        table = dt.to_pyarrow_table()
-    except Exception as e:
-        raise FileNotFoundError(f"Asset '{name}' not found: {e}")
-
-    report = {
-        "name": name,
-        "row_count": len(table),
-        "columns": table.column_names,
-        "issues": [],
-        "needs_cleanup": False
-    }
-
-    # Check expected columns
-    if expected_columns:
-        missing = set(expected_columns) - set(table.column_names)
-        if missing:
-            report["issues"].append(f"Missing columns: {missing}")
-            report["needs_cleanup"] = True
-
-    # Check key uniqueness and nulls
-    if key:
-        keys = [key] if isinstance(key, str) else key
-        report["key"] = keys
-
-        # Check key columns exist
-        missing_keys = [k for k in keys if k not in table.column_names]
-        if missing_keys:
-            report["issues"].append(f"Key columns missing: {missing_keys}")
-            report["needs_cleanup"] = True
-        else:
-            # Check nulls in key columns
-            key_nulls = {}
-            for k in keys:
-                null_count = table[k].null_count
-                if null_count > 0:
-                    key_nulls[k] = null_count
-            if key_nulls:
-                report["key_nulls"] = key_nulls
-                report["issues"].append(f"Nulls in key columns: {key_nulls}")
-                report["needs_cleanup"] = True
-
-            # Check duplicates
-            import pyarrow.compute as pc
-            if len(keys) == 1:
-                unique_count = len(table[keys[0]].unique())
-            else:
-                combined = pc.binary_join_element_wise(
-                    *[pc.cast(table[k], pa.string()) for k in keys],
-                    "||"
-                )
-                unique_count = len(combined.unique())
-
-            dup_count = len(table) - unique_count
-            if dup_count > 0:
-                report["key_duplicates"] = dup_count
-                report["issues"].append(f"{dup_count} duplicate key combinations")
-                report["needs_cleanup"] = True
-
-    # Summary
-    if report["needs_cleanup"]:
-        print(f"⚠️  [{name}] Needs cleanup: {', '.join(report['issues'])}")
-    else:
-        print(f"✅ [{name}] Valid: {len(table):,} rows, key={key}")
-
-    return report
-
-
 def _get_uri(name: str) -> str:
     """Get Delta table URI based on environment."""
     if is_cloud():
@@ -195,25 +96,6 @@ def _target_row_count(dt: DeltaTable) -> int:
         return int(sum(v for v in col.to_pylist() if v is not None))
     except Exception:
         return -1
-
-
-def _log_write(name: str, table: pa.Table, mode: str):
-    """Log the write operation."""
-    size_mb = round(table.nbytes / 1024 / 1024, 2)
-    cols = ', '.join([f.name for f in table.schema])
-    print(f"[{mode}] {name}: {len(table):,} rows, {len(table.schema)} cols ({cols}), {size_mb} MB")
-
-    # Debug logging
-    null_counts = {col: table[col].null_count for col in table.column_names if table[col].null_count > 0}
-    debug.log_data_output(
-        dataset_name=name,
-        row_count=len(table),
-        size_bytes=table.nbytes,
-        columns=table.column_names,
-        column_count=len(table.schema),
-        null_counts=null_counts,
-        mode=mode
-    )
 
 
 def _log_write_meta(name: str, schema: pa.Schema, row_count: int, mode: str):

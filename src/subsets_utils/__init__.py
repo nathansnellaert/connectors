@@ -8,7 +8,7 @@ from .io import (
     list_raw_files, delete_raw_file, data_hash, raw_parquet_hash, raw_asset_exists,
     raw_writer, raw_reader, raw_parquet_writer,
 )
-from .delta import merge, overwrite, append, validate_asset, WriteResult
+from .delta import merge, overwrite, append, WriteResult
 from .orchestrator import DAG, load_nodes
 from .spec import NodeSpec, MaintainSpec
 from . import duckdb
@@ -17,13 +17,12 @@ from .publish import publish
 from .testing import validate
 from .health import run_health_tests
 from . import debug
-from . import catalog
 
 __all__ = [
     # HTTP
     'get', 'post', 'put', 'delete', 'get_client', 'configure_http',
     # Delta writes
-    'merge', 'overwrite', 'append', 'validate_asset', 'WriteResult',
+    'merge', 'overwrite', 'append', 'WriteResult',
     # Publishing
     'publish',
     # State & raw I/O

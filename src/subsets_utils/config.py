@@ -23,11 +23,6 @@ def get_connector_name() -> str:
     return os.environ.get('CONNECTOR_NAME') or Path.cwd().name
 
 
-def get_run_id() -> str:
-    """Get current run ID."""
-    return os.environ.get('RUN_ID', 'unknown')
-
-
 # =============================================================================
 # Directory Configuration
 # =============================================================================
@@ -55,29 +50,32 @@ def get_data_dir() -> str:
 
 
 # =============================================================================
-# SSD Mirror — read-only reflection of R2 production state
+# Dev read-fallback — read-only directory consulted when a raw/state file
+# isn't in the local dev dir yet.
 #
-# The R2 → SSD sync daemon (meta/services/r2_sync.py) keeps this in sync
-# with cloud writes. Dev runs read from here as a fallback when a file
-# isn't yet in the local dev dir, so you don't have to re-download.
+# Purely a local-dev convenience: lets dev runs reuse data already fetched
+# elsewhere (e.g. an external reflection of prod state) without re-downloading.
+# OPT-IN and dev-only — disabled unless SUBSETS_MIRROR_ROOT points at an
+# existing directory; never consulted in cloud or for writes. The library
+# carries no machine-specific default path; the location is entirely the
+# operator's to supply via the env var.
 # =============================================================================
 
-_MIRROR_ROOT_DEFAULT = "/Volumes/ExtremeSSD/data-integrations/integrations"
-
-
 def get_mirror_root() -> Path | None:
-    """Root of the SSD mirror (read-only). Returns None if unavailable.
+    """Root of the read-only dev fallback, or None when unset/missing.
 
-    Override with SUBSETS_MIRROR_ROOT env var. Falls back to None if the
-    path doesn't exist (e.g. SSD not mounted) — callers should handle that
-    gracefully by skipping the fallback.
+    Set SUBSETS_MIRROR_ROOT to enable. Returns None if the var is unset or the
+    path doesn't exist — callers skip the fallback in that case.
     """
-    root = Path(os.environ.get('SUBSETS_MIRROR_ROOT', _MIRROR_ROOT_DEFAULT))
-    return root if root.exists() else None
+    root = os.environ.get('SUBSETS_MIRROR_ROOT')
+    if not root:
+        return None
+    p = Path(root)
+    return p if p.exists() else None
 
 
 def mirror_raw_path(asset_id: str, ext: str = "parquet") -> Path | None:
-    """Path to a raw asset in the SSD mirror. Returns None if mirror unavailable."""
+    """Path to a raw asset in the dev fallback. None if fallback unavailable."""
     root = get_mirror_root()
     if root is None:
         return None
@@ -85,7 +83,7 @@ def mirror_raw_path(asset_id: str, ext: str = "parquet") -> Path | None:
 
 
 def mirror_state_path(asset: str) -> Path | None:
-    """Path to a state file in the SSD mirror. Returns None if mirror unavailable."""
+    """Path to a state file in the dev fallback. None if fallback unavailable."""
     root = get_mirror_root()
     if root is None:
         return None
@@ -174,7 +172,15 @@ def get_fs(uri: str = ""):
     """
     import fsspec
     if uri.startswith("s3://"):
-        return fsspec.filesystem("s3", **get_fsspec_storage_options("s3://"))
+        # Cloudflare R2 rejects a multipart upload whose non-final parts differ
+        # in size ("All non-trailing parts must have the same length"). s3fs only
+        # emits uniform parts when constructed with fixed_upload_size=True, so any
+        # multipart-sized write streamed straight to R2 (e.g. a large parquet from
+        # raw_parquet_writer) needs it. Passed as a constructor kwarg so it lands
+        # in fsspec's instance-cache key and is set correctly at build time.
+        return fsspec.filesystem(
+            "s3", fixed_upload_size=True, **get_fsspec_storage_options("s3://")
+        )
     return fsspec.filesystem("file", auto_mkdir=True)
 
 
@@ -203,15 +209,6 @@ def get_r2_base() -> str:
     return f"{prefix}/{base}" if prefix else base
 
 
-def raw_key(asset_id: str, ext: str = "parquet", *, entity_id: str | None = None) -> str:
-    """R2 key for a raw asset. When entity_id is given, namespaces under
-    `<entity_id>/`; otherwise flat layout (legacy / data-integrations connectors)."""
-    base = get_r2_base()
-    if entity_id is not None:
-        return f"{base}/raw/{entity_id}/{asset_id}.{ext}"
-    return f"{base}/raw/{asset_id}.{ext}"
-
-
 def raw_uri(asset_id: str, ext: str = "parquet", *, entity_id: str | None = None) -> str:
     """URI for a raw asset. s3:// in cloud, local path in dev.
 
@@ -223,11 +220,6 @@ def raw_uri(asset_id: str, ext: str = "parquet", *, entity_id: str | None = None
             return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{entity_id}/{asset_id}.{ext}"
         return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{asset_id}.{ext}"
     return raw_path(asset_id, ext, entity_id=entity_id)
-
-
-def state_key(asset: str) -> str:
-    """R2 key for a state file."""
-    return f"{get_r2_base()}/state/{asset}.json"
 
 
 def state_uri(asset: str) -> str:

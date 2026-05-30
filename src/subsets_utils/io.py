@@ -35,7 +35,7 @@ from . import debug
 from .config import (
     is_cloud, get_data_dir, get_storage_options, get_bucket_name,
     get_fs, get_fsspec_storage_options,
-    raw_uri, state_uri, subsets_uri, raw_key, state_key,
+    raw_uri, state_uri, subsets_uri,
     mirror_raw_path, mirror_state_path,
 )
 

@@ -1,68 +1,84 @@
-"""Bank of Canada — Valet REST download nodes.
+"""Bank of Canada Valet API — download step.
 
-Two entities (the rank-approved union):
+Mechanism: valet_rest (https://www.bankofcanada.ca/valet/). No auth, no key.
 
-  * ``series`` — the full Valet series catalog (one row per series: id, label,
-    description, link). A snapshot, overwritten each run.
-  * ``values`` — long-format observations across every series
-    (one row per (series_id, date, value)). A bounded firehose: ~15.5k series,
-    each ``/observations/{names}/json`` call returning the full history of the
-    requested series, joined by date. Backfilled across runs via a sorted
-    series-id cursor (completeness derived from cursor vs the catalog — no
-    terminal flag), then refreshed incrementally via ``start_date``.
+Two collect entities → two download specs:
 
-Mechanism: ``valet_rest`` — no auth, no key.
+  * ``series`` — the full series catalog from ``/lists/series/json``
+    (one row per series: series_id, label, description, link). Small, stable,
+    tabular → single parquet asset.
 
-Why the listing gets a long read timeout: ``/lists/series/json`` is a single
-~3.5 MB document that the server occasionally takes >120s to emit (observed: a
-clean 120s read-timeout on one probe, 0.15s on the next). Both nodes fetch it
-first, so a tight timeout there hangs the whole run — the prior attempt burned
-61 minutes on it and was cancelled before writing anything. A generous read
-timeout plus transient-retry absorbs the slow-but-completing case.
+  * ``values`` — the long-format observation firehose across *all* ~15.6k
+    series. Far too large for one file, so this is a batched firehose
+    (shape 3): the series universe is sorted and walked in chunks, each chunk
+    fetched in one comma-separated multi-series observation call and written as
+    its own NDJSON batch asset ``bank-of-canada-values-{chunk_index}``.
+
+    NDJSON (not parquet) is deliberate: the observation payload is
+    heterogeneous. Most series carry a date dimension (``{"d": "...",
+    "<sid>": {"v": "..."}}``) but some (e.g. ``AUC_BOND_*``) carry a
+    non-date dimension keyed by ``bond_id`` etc. The dimension key is named by
+    ``seriesDetail[sid].dimension.key`` and varies across series, so rows are
+    parsed generically into ``{series_id, dim_key, dim_value, value}`` and the
+    string-typed value is left for transform to coerce.
+
+Refresh strategy for ``values``: full re-pull every run (overwriting each
+batch). BoC series are revised, so trusting a per-series date watermark would
+silently drop corrections; a full pass over the corpus is cheap (~300 chunked
+calls, a few minutes). State is used only for *in-run crash resume* (which
+chunk to continue from), never as a terminal flag — a completed pass resets to
+chunk 0 on the next invocation. ``start_date`` incremental query is supported
+by the API but intentionally unused for the reason above.
+
+Freshness gating (whether a spec runs at all) is the maintain step's job.
 """
 
-import re
+from __future__ import annotations
+
+import math
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 import pyarrow as pa
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from ratelimit import limits, sleep_and_retry
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from subsets_utils import NodeSpec, get, load_state, save_raw_parquet, save_state
+from subsets_utils import (
+    NodeSpec,
+    get,
+    save_raw_ndjson,
+    save_raw_parquet,
+    load_state,
+    save_state,
+)
 
-BASE = "https://www.bankofcanada.ca/valet"
+BASE_URL = "https://www.bankofcanada.ca/valet"
 
-# Watermark/cursor contract version. Bump when the `values` state shape changes
-# so stale state from an older shape is discarded rather than misread.
+# Bump when the `values` resume-state contract changes (keys / cursor shape).
 STATE_VERSION = 1
 
-# Series per multi-series observation request. 50 ids → ~1 KB URL (proven:
-# 1057 chars), ~2.4 MB response, ~25k long rows, ~1s. Small enough that a
-# batch 404 (one discontinued id 404s the whole batch) only forces a cheap
-# 50-call per-series fallback.
-REQUEST_BATCH = 50
+# Series per multi-series observation call. 50 keeps URLs ~1KB and per-chunk
+# responses a few MB; ~313 chunks for the current ~15.6k-series corpus.
+CHUNK_SIZE = 50
 
-# Flush a backfill parquet every N consumed chunks. Bounds buffer memory
-# (~N*25k rows) and how stale the resume cursor can get. ~312 chunks total →
-# ~21 files for a full backfill.
-FLUSH_EVERY_CHUNKS = 15
+# A partial pass older than this is meaningless to resume (the corpus moves on);
+# treat stale in-flight state as empty and start a fresh full pass.
+STALE_RESUME_SECONDS = 2 * 86400
 
-# Soft per-run budget for the firehose. A full backfill is ~6 min, so this is
-# a safety ceiling, not a normal stopping point — hitting it returns cleanly
-# with the cursor advanced and the next run resumes.
-MAX_FETCH_SECONDS = 3000
+# Skipped-chunk markers (permanent 4xx on a chunk) expire so source recovery is
+# automatic.
+SKIP_TTL_SECONDS = 14 * 86400
 
-# Refresh re-fetch window: re-pull recent observations to absorb late
-# revisions. Duplicates from the overlap are dedup'd downstream by the
-# (series_id, date) merge.
-OVERLAP_DAYS = 14
-
-# The big catalog listing flakes (server-side slow emit); give it room.
-LISTING_READ_TIMEOUT = 300.0
-# Observation payloads are small/medium and fast; keep the read timeout tight
-# so a rare hung call can't eat the budget through retries.
-OBS_READ_TIMEOUT = 90.0
+# Safety ceiling: if the series listing balloons far past observed scale,
+# surface it loudly rather than silently churning through tens of thousands of
+# extra calls.
+MAX_SERIES = 60_000
 
 SERIES_SCHEMA = pa.schema([
     ("series_id", pa.string()),
@@ -71,15 +87,14 @@ SERIES_SCHEMA = pa.schema([
     ("link", pa.string()),
 ])
 
-VALUES_SCHEMA = pa.schema([
-    ("series_id", pa.string()),
-    ("date", pa.string()),       # ISO "YYYY-MM-DD"; transform casts to date
-    ("value", pa.float64()),
-])
-
 _TRANSIENT_EXC = (
-    httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
-    httpx.WriteTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError, httpx.ProxyError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ProxyError,
 )
 
 
@@ -92,90 +107,49 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+@sleep_and_retry
+@limits(calls=4, period=1)  # polite ~4 rps; docs advise a gradual request rate
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(min=4, max=90),
+    stop=stop_after_attempt(6),
+    wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
-def _get_json(url: str, params: dict | None = None, read_timeout: float = OBS_READ_TIMEOUT):
-    # Docs advise polite throttling + exponential backoff; no hard rate limit.
-    resp = get(url, params=params, timeout=(10.0, read_timeout))
+def _get_json(url: str, params: dict | None = None) -> dict:
+    resp = get(url, params=params, timeout=(10.0, 180.0))
     resp.raise_for_status()
     return resp.json()
 
 
-def _san(sid: str) -> str:
-    """Sanitize a series id into a filename-safe token."""
-    return re.sub(r"[^a-z0-9]+", "-", sid.lower()).strip("-") or "x"
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-def _list_series() -> dict:
-    """The full Valet series catalog as {series_id: {label, description, link}}."""
-    payload = _get_json(f"{BASE}/lists/series/json", read_timeout=LISTING_READ_TIMEOUT)
-    series = payload.get("series") or {}
+def _fetch_series_index() -> list[str]:
+    """Return the sorted list of all series ids exposed by the Valet API."""
+    payload = _get_json(f"{BASE_URL}/lists/series/json")
+    series = payload.get("series", {})
     if not series:
-        raise AssertionError("lists/series/json returned no series")
-    return series
+        raise AssertionError("lists/series returned no series — unexpected")
+    if len(series) > MAX_SERIES:
+        raise AssertionError(
+            f"series count {len(series)} exceeds safety ceiling {MAX_SERIES}; "
+            "investigate before crawling"
+        )
+    return sorted(series.keys())
 
 
-def _unpivot(payload: dict) -> list[dict]:
-    """Wide date-joined rows -> long (series_id, date, value) rows.
+# --------------------------------------------------------------------------- #
+# Entity: series — the series catalog
+# --------------------------------------------------------------------------- #
 
-    Each observation is {"d": date, "<series>": {"v": "<str>"}, ...}; a series
-    absent on a date is simply omitted, and empty / non-numeric values are
-    dropped (a missing observation is not a row)."""
-    rows: list[dict] = []
-    for obs in payload.get("observations", []):
-        d = obs.get("d")
-        if not d:
-            continue
-        for sid, cell in obs.items():
-            if sid == "d":
-                continue
-            v = cell.get("v") if isinstance(cell, dict) else None
-            if v is None or v == "":
-                continue
-            try:
-                val = float(v)
-            except (TypeError, ValueError):
-                continue
-            rows.append({"series_id": sid, "date": d, "value": val})
-    return rows
+def fetch_series(node_id: str) -> None:
+    asset = node_id  # the spec id IS the asset name
+    payload = _get_json(f"{BASE_URL}/lists/series/json")
+    series = payload.get("series", {})
+    if not series:
+        raise AssertionError("lists/series returned no series — unexpected")
 
-
-def _fetch_obs(series_ids: list[str], start_date: str | None = None) -> list[dict]:
-    """Fetch + un-pivot a chunk. A single discontinued/invalid id 404s the
-    whole multi-series call (confirmed by probe), so on a 4xx for a batch we
-    fall back to per-series and skip only the ids that 404."""
-    names = ",".join(series_ids)
-    params = {"start_date": start_date} if start_date else None
-    try:
-        return _unpivot(_get_json(f"{BASE}/observations/{names}/json", params=params))
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code in (400, 404) and len(series_ids) > 1:
-            rows: list[dict] = []
-            for sid in series_ids:
-                try:
-                    rows.extend(_unpivot(_get_json(
-                        f"{BASE}/observations/{sid}/json", params=params)))
-                except httpx.HTTPStatusError as e2:
-                    if e2.response.status_code in (400, 404):
-                        print(f"[values] skip {sid}: HTTP {e2.response.status_code}", flush=True)
-                        continue
-                    raise
-            return rows
-        raise
-
-
-def fetch_series(entity_id: str) -> None:
-    """Snapshot the full Valet series catalog into one parquet asset."""
-    asset = f"bank-of-canada-{entity_id.lower().replace('_', '-')}"
-    series = _list_series()
     rows = [
         {
             "series_id": sid,
@@ -183,143 +157,173 @@ def fetch_series(entity_id: str) -> None:
             "description": meta.get("description"),
             "link": meta.get("link"),
         }
-        for sid, meta in series.items()
+        for sid, meta in sorted(series.items())
     ]
     table = pa.Table.from_pylist(rows, schema=SERIES_SCHEMA)
     save_raw_parquet(table, asset)
-    print(f"[series] wrote {len(rows)} series to {asset}", flush=True)
+    print(f"[{asset}] wrote {len(rows)} series", flush=True)
 
 
-def _backfill(state_key: str, remaining: list[str], cursor: str | None,
-              date_watermark: str | None, deadline: float) -> None:
-    """Walk the un-backfilled series in sorted order, fetching full history in
-    REQUEST_BATCH chunks and flushing a parquet every FLUSH_EVERY_CHUNKS. The
-    persisted cursor only advances on flush (raw written first), so a crash
-    re-fetches at most one flush window — never silently skips a series."""
-    buf: list[dict] = []
-    range_start: str | None = None   # first id consumed in the current window
-    consumed_last: str | None = None  # last id consumed (flushed or empty)
-    chunks_since_flush = 0
-    max_date = date_watermark
-    flushed_files = 0
-    n = len(remaining)
+# --------------------------------------------------------------------------- #
+# Entity: values — the observation firehose (batched, full re-pull)
+# --------------------------------------------------------------------------- #
 
-    def flush() -> None:
-        nonlocal buf, range_start, consumed_last, chunks_since_flush, flushed_files, cursor
-        if consumed_last is None:
-            return
-        if buf:
-            key = f"{state_key}-{_san(range_start)}--{_san(consumed_last)}"
-            save_raw_parquet(pa.Table.from_pylist(buf, schema=VALUES_SCHEMA), key)  # raw FIRST
-            flushed_files += 1
-        cursor = consumed_last  # advance resume point (over written-or-empty range)
-        save_state(state_key, {                                                    # state AFTER raw
-            "schema_version": STATE_VERSION,
-            "cursor": cursor,
-            "date_watermark": max_date,
-            "last_run_stats": {
-                "phase": "backfill", "cursor": cursor,
-                "flushed_files": flushed_files, "rows_last_flush": len(buf),
-            },
-        })
-        buf, range_start, consumed_last, chunks_since_flush = [], None, None, 0
+def _parse_observations(payload: dict) -> list[dict]:
+    """Flatten a (multi-)series observation payload into long-format rows.
 
-    for i in range(0, n, REQUEST_BATCH):
-        if time.monotonic() > deadline:
-            print(f"[values] backfill budget reached at {i}/{n}, cursor={cursor}", flush=True)
-            break
-        chunk = remaining[i:i + REQUEST_BATCH]
-        if range_start is None:
-            range_start = chunk[0]
-        rows = _fetch_obs(chunk)
-        if rows:
-            buf.extend(rows)
-            cmax = max(r["date"] for r in rows)
-            if max_date is None or cmax > max_date:
-                max_date = cmax
-        consumed_last = chunk[-1]
-        chunks_since_flush += 1
-        if chunks_since_flush >= FLUSH_EVERY_CHUNKS:
-            flush()
-        if (i // REQUEST_BATCH) % 25 == 0:
-            print(f"[values] backfill chunk {i // REQUEST_BATCH} "
-                  f"(series {i}/{n}), buffered={len(buf)}", flush=True)
-
-    flush()  # remainder
-    print(f"[values] backfill pass done: {flushed_files} files this run, cursor={cursor}", flush=True)
+    Each observation row carries exactly one dimension key (the key NOT present
+    in ``seriesDetail`` — usually ``d`` for a date, but e.g. ``bond_id`` for
+    auction series) plus one entry per series id present on that row, each a
+    ``{"v": "..."}`` dict. Values are strings (or absent); transform coerces.
+    """
+    detail = payload.get("seriesDetail", {})
+    out: list[dict] = []
+    for row in payload.get("observations", []):
+        dim_keys = [k for k in row if k not in detail]
+        if not dim_keys:
+            continue
+        dim_key = dim_keys[0]
+        dim_value = row.get(dim_key)
+        for sid, cell in row.items():
+            if sid == dim_key or sid not in detail:
+                continue
+            value = cell.get("v") if isinstance(cell, dict) else None
+            out.append(
+                {
+                    "series_id": sid,
+                    "dim_key": dim_key,
+                    "dim_value": dim_value,
+                    "value": value,
+                }
+            )
+    return out
 
 
-def _refresh(state_key: str, all_series: list[str], date_watermark: str | None,
-             deadline: float) -> None:
-    """Re-pull recent observations (>= watermark - overlap) for every series.
-    Cheap (small per-series payloads); written as one or a few parquet parts."""
-    base = date_watermark or (date.today() - timedelta(days=30)).isoformat()
-    start = (date.fromisoformat(base) - timedelta(days=OVERLAP_DAYS)).isoformat()
-    print(f"[values] refresh from start_date={start} across {len(all_series)} series", flush=True)
-
-    buf: list[dict] = []
-    max_date = date_watermark
-    parts = 0
-    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    n = len(all_series)
-
-    def flush() -> None:
-        nonlocal buf, parts
-        if not buf:
-            return
-        parts += 1
-        save_raw_parquet(pa.Table.from_pylist(buf, schema=VALUES_SCHEMA),
-                         f"{state_key}-r{run_ts}-{parts:03d}")
-        buf = []
-
-    for i in range(0, n, REQUEST_BATCH):
-        if time.monotonic() > deadline:
-            print(f"[values] refresh budget reached at {i}/{n}", flush=True)
-            break
-        rows = _fetch_obs(all_series[i:i + REQUEST_BATCH], start_date=start)
-        if rows:
-            buf.extend(rows)
-            cmax = max(r["date"] for r in rows)
-            if max_date is None or cmax > max_date:
-                max_date = cmax
-        if len(buf) >= FLUSH_EVERY_CHUNKS * 25_000:
-            flush()
-    flush()  # remainder; raw FIRST
-
-    save_state(state_key, {                                       # state AFTER raw
-        "schema_version": STATE_VERSION,
-        "cursor": all_series[-1],   # stay in refresh; new tail series re-trigger backfill
-        "date_watermark": max_date or base,
-        "last_run_stats": {"phase": "refresh", "start_date": start, "files": parts},
-    })
-    print(f"[values] refresh done: {parts} files, watermark={max_date}", flush=True)
+def _purge_expired_skips(skipped: dict) -> dict:
+    now = int(time.time())
+    return {
+        k: v
+        for k, v in skipped.items()
+        if not (isinstance(v, dict) and v.get("expires_at", 0) < now)
+    }
 
 
-def fetch_values(entity_id: str) -> None:
-    """Observations firehose. Backfill full history (cursor-paced) until the
-    cursor reaches the end of the sorted catalog, then incremental refresh."""
-    state_key = f"bank-of-canada-{entity_id.lower().replace('_', '-')}"
+def fetch_values(node_id: str) -> None:
+    state_key = node_id  # "bank-of-canada-values"
+
+    series_ids = _fetch_series_index()
+    total_chunks = math.ceil(len(series_ids) / CHUNK_SIZE)
+
     state = load_state(state_key)
-    if state and state.get("schema_version") != STATE_VERSION:
-        print(f"[values] state schema_version {state.get('schema_version')} != "
-              f"{STATE_VERSION}; resetting state", flush=True)
+    if state.get("schema_version") != STATE_VERSION:
+        if state:
+            print(
+                f"[{state_key}] state schema_version mismatch "
+                f"({state.get('schema_version')} != {STATE_VERSION}); resetting",
+                flush=True,
+            )
         state = {}
 
-    cursor = state.get("cursor")              # last series_id fully backfilled (sorted)
-    date_watermark = state.get("date_watermark")
+    done = int(state.get("completed_chunks", 0))
+    last_success = state.get("last_success_at")
+    stale = True
+    if last_success:
+        try:
+            age = (
+                datetime.now(tz=timezone.utc)
+                - datetime.fromisoformat(last_success)
+            ).total_seconds()
+            stale = age > STALE_RESUME_SECONDS
+        except ValueError:
+            stale = True
 
-    all_series = sorted(_list_series().keys())
-    deadline = time.monotonic() + MAX_FETCH_SECONDS
+    # Resume an in-flight pass only if it matches the current corpus, isn't
+    # already complete, and is recent. Otherwise start a fresh full re-pull.
+    fresh = (
+        state.get("series_count") != len(series_ids)
+        or done >= total_chunks
+        or stale
+    )
+    start = 0 if fresh else done
+    skipped = _purge_expired_skips(state.get("skipped", {}) if not fresh else {})
 
-    remaining = [s for s in all_series if cursor is None or s > cursor]
-    if remaining:
-        print(f"[values] backfill: {len(remaining)} of {len(all_series)} series remaining", flush=True)
-        _backfill(state_key, remaining, cursor, date_watermark, deadline)
-    else:
-        _refresh(state_key, all_series, date_watermark, deadline)
+    print(
+        f"[{state_key}] {len(series_ids)} series, {total_chunks} chunks; "
+        f"{'fresh pass' if fresh else f'resuming at chunk {start}'}",
+        flush=True,
+    )
+
+    total_rows = 0
+    for ci in range(start, total_chunks):
+        batch_key = f"{ci:04d}"
+        asset = f"{state_key}-{batch_key}"
+        chunk = series_ids[ci * CHUNK_SIZE : (ci + 1) * CHUNK_SIZE]
+        url = f"{BASE_URL}/observations/{','.join(chunk)}/json"
+        try:
+            payload = _get_json(url)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            # Transient (429/5xx) is retried by the decorator; reaching here on
+            # a 4xx means a permanent failure for this chunk.
+            if code != 429 and 400 <= code < 500:
+                print(
+                    f"[{asset}] permanent {code} for chunk {ci} "
+                    f"(url={url}); skipping",
+                    flush=True,
+                )
+                skipped[batch_key] = {
+                    "reason": f"http_{code}",
+                    "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
+                }
+                # raw-before-state holds: no raw written, advance progress only.
+                save_state(state_key, {
+                    "schema_version": STATE_VERSION,
+                    "series_count": len(series_ids),
+                    "total_chunks": total_chunks,
+                    "completed_chunks": ci + 1,
+                    "last_success_at": _now_iso(),
+                    "skipped": skipped,
+                })
+                continue
+            raise
+
+        rows = _parse_observations(payload)
+        # Write raw FIRST, then advance state.
+        save_raw_ndjson(rows, asset)
+        total_rows += len(rows)
+        save_state(state_key, {
+            "schema_version": STATE_VERSION,
+            "series_count": len(series_ids),
+            "total_chunks": total_chunks,
+            "completed_chunks": ci + 1,
+            "last_success_at": _now_iso(),
+            "skipped": skipped,
+        })
+
+        if (ci + 1) % 25 == 0 or ci + 1 == total_chunks:
+            print(
+                f"[{state_key}] chunk {ci + 1}/{total_chunks} "
+                f"(+{len(rows)} rows, {total_rows} this run)",
+                flush=True,
+            )
+
+    # Stamp run stats for cross-run drift diagnostics.
+    final = load_state(state_key)
+    final["last_run_stats"] = {
+        "chunks_fetched": total_chunks - start,
+        "rows_this_run": total_rows,
+        "series_count": len(series_ids),
+        "skipped_chunks": len(skipped),
+    }
+    save_state(state_key, final)
+    print(
+        f"[{state_key}] pass complete: {total_rows} rows across "
+        f"{total_chunks - start} chunks ({len(skipped)} skipped)",
+        flush=True,
+    )
 
 
-DOWNLOAD_SPECS = [
-    NodeSpec(id="bank-of-canada-series", fn=fetch_series, args=("series",), deps=(), kind="download"),
-    NodeSpec(id="bank-of-canada-values", fn=fetch_values, args=("values",), deps=(), kind="download"),
+DOWNLOAD_SPECS: list[NodeSpec] = [
+    NodeSpec(id="bank-of-canada-series", fn=fetch_series, kind="download"),
+    NodeSpec(id="bank-of-canada-values", fn=fetch_values, kind="download"),
 ]

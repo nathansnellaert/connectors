@@ -1,7 +1,7 @@
 """NodeSpec: the unit the runtime DAG executes.
 MaintainSpec: freshness policy consumed by the orchestrator pre-spawn."""
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -9,17 +9,16 @@ class NodeSpec:
     """A single DAG node.
 
     `fn` must be importable (top-level function or method); closures and
-    lambdas fail under spawn-context subprocess execution.
+    lambdas fail under spawn-context subprocess execution. The runtime calls
+    it as `fn(id)` — a node's only input is its own id, which is also the
+    asset name it writes. Nodes do not pass state to one another.
 
     `id` must be globally unique within a connector's loaded specs.
-    `deps` are spec ids (strings), validated at load time.
     `kind` is matched against DAG_TARGET when filtering (e.g. "download",
     "transform"). It also routes per-stage status in manifests.
     """
     id: str
     fn: Callable
-    args: tuple = field(default=())
-    deps: tuple[str, ...] = field(default=())
     kind: str = "download"
 
 

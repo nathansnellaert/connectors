@@ -4,7 +4,7 @@ Pure stdlib utility. `compute_spec_hash()` reads a node module's source file
 without importing it, walks the AST of a target function plus transitively
 reachable connector-local code, applies cosmetic-resilience canonicalization
 (strip docstrings, normalize string literals, sort module-level constants,
-alpha-rename locals + parameters), folds in canonicalized args, and returns
+alpha-rename locals + parameters), and returns
 a sha256 hex digest. None on parse failure — caller treats as force re-run.
 
 The hash is a function of:
@@ -12,11 +12,10 @@ The hash is a function of:
   - every same-module top-level def/const transitively reachable from it
   - every connector-local imported def reached via fence-dir resolution
   - external imports (subsets_utils, requests, stdlib) → leaf tokens by module name
-  - the spec's args (json-canonicalized; default=repr fallback)
 
 Cosmetic edits (whitespace, comments, docstrings, local-var renames) do not
 change the hash. Behavioral edits (signature change, helper edit, constant
-value change, args change) do.
+value change) do.
 
 Used by:
   - the harness DownloadStep pre-spawn to write expected_hashes.json
@@ -365,17 +364,15 @@ def _walk_and_collect(
 def compute_spec_hash(
     fn_source_file: str | Path | None,
     fn_qualname: str,
-    args,
     *,
     fence_dirs: list[str | Path] | None = None,
 ) -> str | None:
-    """Hash a NodeSpec's transitively-reachable code + canonicalized args.
+    """Hash a NodeSpec's transitively-reachable code.
 
     fn_source_file: Path to the .py file containing the spec's fn (from
         inspect.getsourcefile, captured at spec-dump time).
     fn_qualname: The fn's __name__ (NodeSpec.fn is required to be top-level
         importable, so dotted qualnames are not expected).
-    args: The spec's args (already JSON-canonicalized at the dump layer).
     fence_dirs: Directories inside which to resolve imports recursively
         (typically [connector/src]). Imports outside the fence become leaf
         version tokens.
@@ -397,14 +394,6 @@ def compute_spec_hash(
             _walk_and_collect(file, fn_qualname, fence, visited, indices, parts)
         except _ParseFailed:
             return None
-        # Canonicalize args. json with sort_keys handles dicts/lists; default
-        # falls back to repr for anything that isn't JSON-native (rare — the
-        # spec-dump layer already enforces JSON-serializability).
-        try:
-            args_str = json.dumps(args, sort_keys=True, default=repr)
-        except (TypeError, ValueError):
-            args_str = repr(args)
-        parts.append(f"args:{args_str}")
         parts.sort()
         h = hashlib.sha256()
         for p in parts:

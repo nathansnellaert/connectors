@@ -1,7 +1,9 @@
 """DAG orchestration with run-state persistence.
 
 The DAG class:
-- Builds a topological order from a list of NodeSpec instances
+- Runs each NodeSpec in declaration order, each in a fresh forked subprocess
+  (memory isolation per node). Nodes are independent — there is no
+  cross-node sequencing; ordering is just the order specs are declared.
 - Runs each node in a fresh forked subprocess (memory isolation per node)
 - Writes run.json after each node
 - Marks status as "needs_continuation" if any node returns True (pagination)
@@ -9,7 +11,7 @@ The DAG class:
 
 Subprocess-per-node:
 - Each node is executed in a forked child process via multiprocessing.
-- Child runs one fn(*args), pipes back a result dict, exits. OS reclaims RSS.
+- Child runs one fn(id), pipes back a result dict, exits. OS reclaims RSS.
 - One node OOMing only kills that node; the rest of the DAG continues.
 - Tracking state (asset_writers, io_records) is serialized by the child and
   merged into the supervisor's tracking module after each node completes.
@@ -78,11 +80,9 @@ _MAX_RESULT_PICKLE_BYTES = 10 * 1024 * 1024
 
 
 def _topology_hash(specs: list[NodeSpec]) -> str:
-    """Hash of DAG topology — used to detect changes between invocations."""
-    items = sorted(
-        (spec.id, sorted(spec.deps))
-        for spec in specs
-    )
+    """Hash of the node set — used to detect changes between invocations.
+    With no inter-node deps, "topology" is just the set of (id, kind)."""
+    items = sorted((spec.id, spec.kind) for spec in specs)
     return hashlib.md5(json.dumps(items).encode()).hexdigest()[:16]
 
 
@@ -226,13 +226,6 @@ class DAG:
             if s.id in seen:
                 raise ValueError(f"Duplicate NodeSpec id: {s.id!r}")
             seen[s.id] = s
-        # Validate: unknown deps.
-        for s in specs:
-            for dep_id in s.deps:
-                if dep_id not in seen:
-                    raise ValueError(
-                        f"NodeSpec {s.id!r} has unknown dep: {dep_id!r}"
-                    )
 
         # Maintain specs: keyed by asset_id. An asset_id with no matching
         # NodeSpec is a no-op (warned but not fatal — keeps the runtime tolerant
@@ -261,7 +254,6 @@ class DAG:
             self.state[spec.id] = {
                 "id": spec.id,
                 "kind": spec.kind,
-                "deps": list(spec.deps),
                 # Where the fetch/transform fn was def'd — for debugging.
                 # functools.wraps preserves this through decorators (@tenacity.retry etc).
                 "source_module": getattr(spec.fn, "__module__", None),
@@ -306,7 +298,7 @@ class DAG:
             else:
                 fence = []
             self._current_hashes[spec.id] = compute_spec_hash(
-                src_file, getattr(spec.fn, "__name__", ""), list(spec.args),
+                src_file, getattr(spec.fn, "__name__", ""),
                 fence_dirs=fence,
             )
 
@@ -321,29 +313,13 @@ class DAG:
                 self._expected_hashes = None
 
     # =========================================================================
-    # Topology
+    # Order
     # =========================================================================
 
-    def _topological_order(self) -> list[NodeSpec]:
-        """Return specs in dependency order (Kahn's algorithm)."""
-        in_degree = {sid: len(spec.deps) for sid, spec in self._specs.items()}
-        ready = [sid for sid, deg in in_degree.items() if deg == 0]
-        order: list[NodeSpec] = []
-
-        while ready:
-            sid = ready.pop(0)
-            order.append(self._specs[sid])
-            for other_sid, other_spec in self._specs.items():
-                if sid in other_spec.deps:
-                    in_degree[other_sid] -= 1
-                    if in_degree[other_sid] == 0:
-                        # Insert at FRONT to run dependent immediately (DFS-style),
-                        # so download→transform pairs run together.
-                        ready.insert(0, other_sid)
-
-        if len(order) != len(self._specs):
-            raise ValueError("Cycle detected in DAG")
-        return order
+    def _execution_order(self) -> list[NodeSpec]:
+        """Return specs in declaration order. Nodes are independent — there
+        are no inter-node deps to order by."""
+        return list(self._specs.values())
 
     # =========================================================================
     # Maintain
@@ -431,7 +407,7 @@ class DAG:
         pipe_r, pipe_w = _MP_CTX.Pipe(duplex=False)
         proc = _MP_CTX.Process(
             target=_child_entrypoint,
-            args=(spec.fn, spec.args, spec.id, pipe_w),
+            args=(spec.fn, (spec.id,), spec.id, pipe_w),
             name=f"node:{spec.id}",
         )
         proc.start()
@@ -574,7 +550,7 @@ class DAG:
         if env_targets:
             targets = [t.strip() for t in env_targets.split(",")]
 
-        order = self._topological_order()
+        order = self._execution_order()
 
         if targets:
             target_set = set(targets)
@@ -588,14 +564,11 @@ class DAG:
                       f"{sorted({s.kind for s in self._specs.values()})}")
                 self.save_state()
                 return self
-            # Mark all non-targeted nodes as "done" so the targeted specs'
-            # deps resolve. The semantic of DAG_TARGET=<kind> is: "run only
-            # this kind, assuming earlier kinds (their deps) were already
-            # satisfied in a previous invocation." Treating filtered-out
-            # specs as skipped would propagate skip into every targeted
-            # spec that has a cross-kind dep — unusable for the meta
-            # download/publish split where publish specs depend on download
-            # specs by id.
+            # Mark all non-targeted nodes as "done". The semantic of
+            # DAG_TARGET=<kind> is "run only this kind, assuming earlier kinds
+            # already ran in a previous invocation." Non-targeted specs are
+            # left out of `order` entirely; marking them done keeps the
+            # manifest/status coherent (they aren't pending-but-never-run).
             targeted_ids = {s.id for s in order}
             for task_id, st in self.state.items():
                 if task_id not in targeted_ids and st["status"] == "pending":
@@ -644,21 +617,9 @@ class DAG:
         consecutive_failures = 0
 
         def find_ready() -> list[NodeSpec]:
-            """Return pending specs whose deps are done, in topological order.
-            Skips specs whose deps already failed (marks them skipped)."""
-            ready: list[NodeSpec] = []
-            for spec in order:
-                if self.state[spec.id]["status"] != "pending":
-                    continue
-                dep_states = [self.state[dep_id]["status"] for dep_id in spec.deps]
-                if any(s in ("failed", "skipped") for s in dep_states):
-                    self.state[spec.id]["status"] = "skipped"
-                    self.state[spec.id]["error"] = "Upstream dependency did not complete"
-                    self.save_state()
-                    continue
-                if all(s == "done" for s in dep_states):
-                    ready.append(spec)
-            return ready
+            """Return every pending spec, in declaration order. Nodes are
+            independent — none gate on another, so any pending node is ready."""
+            return [s for s in order if self.state[s.id]["status"] == "pending"]
 
         # Each node runs in its own forked subprocess so memory is reclaimed
         # between nodes. in_flight maps a live Process to its (task_id, pipe_r).
@@ -921,11 +882,8 @@ class DAG:
             ),
             "dag": {
                 "nodes": nodes_with_io,
-                "edges": [
-                    {"from": dep_id, "to": spec.id}
-                    for spec in self._specs.values()
-                    for dep_id in spec.deps
-                ],
+                # Nodes are independent — no inter-node edges.
+                "edges": [],
                 "total_duration_s": sum(
                     n.get("duration_s") or 0 for n in self.state.values()
                 ),
