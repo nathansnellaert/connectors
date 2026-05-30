@@ -45,6 +45,7 @@ Freshness gating (whether a spec runs at all) is the maintain step's job.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from datetime import datetime, timezone
@@ -115,6 +116,12 @@ _TRANSIENT_EXC = (
 
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, _TRANSIENT_EXC):
+        return True
+    # The Valet host intermittently returns a 200 with an empty / CRLF-only
+    # body under load (observed failure: "Expecting value: line 2 column 1").
+    # Treat a decode failure as a transient glitch worth a few retries; the
+    # chunk fetcher keeps a per-series fallback as the deterministic backstop.
+    if isinstance(exc, json.JSONDecodeError):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
@@ -219,10 +226,12 @@ def _is_permanent_4xx(exc: httpx.HTTPStatusError) -> bool:
 def _fetch_chunk_rows(chunk: list[str], asset: str, skipped: dict) -> list[dict]:
     """Fetch one chunk of series, returning flattened long-format rows.
 
-    Fast path: a single multi-series call. A single invalid id 404s the whole
-    call, so on a permanent 4xx we fall back to per-series calls and skip only
-    the genuinely-bad ids (recording a TTL-bound marker) — never losing the
-    whole chunk to one bad member.
+    Fast path: a single multi-series call. Two ways the bulk call can fail
+    deterministically after retries are exhausted — a permanent 4xx (one
+    invalid id 404s the whole call) or a persistent bad body (decode failure
+    that didn't clear on retry). In both cases we fall back to per-series calls
+    and skip only the genuinely-bad ids (TTL-bound marker) rather than losing
+    the whole chunk to one bad member.
     """
     url = f"{BASE_URL}/observations/{','.join(chunk)}/json"
     try:
@@ -230,12 +239,16 @@ def _fetch_chunk_rows(chunk: list[str], asset: str, skipped: dict) -> list[dict]
     except httpx.HTTPStatusError as exc:
         if not _is_permanent_4xx(exc):
             raise
-        code = exc.response.status_code
-        print(
-            f"[{asset}] bulk call {code}; falling back to per-series for "
-            f"{len(chunk)} ids (url={url})",
-            flush=True,
-        )
+        reason = f"http_{exc.response.status_code}"
+    except json.JSONDecodeError:
+        # Retries (see _is_transient) didn't clear it — drop to per-series so a
+        # single bad member can't sink the chunk.
+        reason = "bad_json"
+    print(
+        f"[{asset}] bulk call failed ({reason}); falling back to per-series for "
+        f"{len(chunk)} ids (url={url})",
+        flush=True,
+    )
 
     rows: list[dict] = []
     for sid in chunk:
@@ -244,18 +257,28 @@ def _fetch_chunk_rows(chunk: list[str], asset: str, skipped: dict) -> list[dict]
                 _parse_observations(_get_json(f"{BASE_URL}/observations/{sid}/json"))
             )
         except httpx.HTTPStatusError as exc:
-            if _is_permanent_4xx(exc):
-                print(
-                    f"[{asset}] permanent {exc.response.status_code} for series "
-                    f"{sid}; skipping",
-                    flush=True,
-                )
-                skipped[sid] = {
-                    "reason": f"http_{exc.response.status_code}",
-                    "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
-                }
-                continue
-            raise
+            if not _is_permanent_4xx(exc):
+                raise
+            print(
+                f"[{asset}] permanent {exc.response.status_code} for series "
+                f"{sid}; skipping",
+                flush=True,
+            )
+            skipped[sid] = {
+                "reason": f"http_{exc.response.status_code}",
+                "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
+            }
+        except json.JSONDecodeError:
+            # Persistent bad body for one series — skip it for this pass with a
+            # short TTL (likely transient; a full re-pull retries it next run).
+            print(
+                f"[{asset}] persistent bad JSON for series {sid}; skipping",
+                flush=True,
+            )
+            skipped[sid] = {
+                "reason": "bad_json",
+                "expires_at": int(time.time()) + 86400,
+            }
     return rows
 
 
