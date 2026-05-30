@@ -170,6 +170,13 @@ def _page_to_table(db: str, series_objs: list[dict], layers_by_code: dict) -> pa
         category = s.get("CATEGORY", "")
         last_update = _coerce_int(s.get("LAST_UPDATE"))
         for period, value in zip(dates, values):
+            p = _coerce_int(period)
+            if p is None:
+                # A period-less observation is unusable for a time series.
+                # SURVEY_DATES very rarely carries a null/blank entry (observed
+                # deep in CO's ~166k series); drop the data point rather than
+                # emit a null-keyed row that no downstream transform can place.
+                continue
             cols["db"].append(db)
             cols["series_code"].append(code)
             cols["name"].append(name)
@@ -181,7 +188,7 @@ def _page_to_table(db: str, series_objs: list[dict], layers_by_code: dict) -> pa
             cols["layer3"].append(layers.get("LAYER3"))
             cols["layer4"].append(layers.get("LAYER4"))
             cols["layer5"].append(layers.get("LAYER5"))
-            cols["period"].append(_coerce_int(period))
+            cols["period"].append(p)
             cols["value"].append(_coerce_float(value))
             cols["last_update"].append(last_update)
     return pa.table({k: cols[k] for k in SCHEMA.names}, schema=SCHEMA)
