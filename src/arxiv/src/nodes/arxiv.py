@@ -65,12 +65,17 @@ EARLIEST_DATESTAMP = "2005-09-16"
 
 # Defensive pacing between OAI calls (research-recommended 3s; ASCII only).
 PACE_SECONDS = 3.0
-# Soft per-run budget: on hit we return cleanly with the watermark advanced and
-# the next refresh resumes. Expected to fire repeatedly during backfill.
+# Soft per-run budget: on hit we checkpoint (resume token saved) and return
+# cleanly; the next refresh resumes. Expected to fire repeatedly during backfill.
 MAX_FETCH_SECONDS = 1200
-# Safety ceiling on pages within a single month — a real month is tens of pages;
-# blowing past this means the source grew unexpectedly, so raise (don't truncate).
-MAX_PAGES_PER_BUCKET = 6000
+# Roll to a fresh part file once a month's open part reaches this many records.
+# Keeps each NDJSON file bounded (~a few hundred MB) and memory flat. Most months
+# are a single part; the 2005-09 legacy-migration month (every pre-2005 paper
+# datestamped at OAI population, ~hundreds of thousands of records) spans several.
+RECORDS_PER_PART = 200_000
+# Safety ceiling on pages harvested for one window in one run — far above any
+# real month; blowing past it means the source grew unexpectedly, so raise.
+MAX_PAGES_PER_RUN = 50_000
 # Progress cadence (~ every few minutes at 3s/page).
 LOG_EVERY_PAGES = 50
 

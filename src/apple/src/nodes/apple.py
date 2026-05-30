@@ -5,11 +5,10 @@ RSS Generator UI. Each chart endpoint is:
 
     https://rss.marketingtools.apple.com/api/v2/{country}/{media}/{chart}/{limit}/{type}.json
 
-The (media, type, chart) triples were discovered live from the generator's own
-dropdown endpoints (`/apple/{media}/{country}/types` and
-`/apple/{media}/{country}/{type}/feeds`) on 2026-05-30 — the research handoff's
-feed-type names (top-grossing, top-songs, coming-soon, ...) are stale; the
-authoritative current set is encoded in ENTITY_CONFIG below.
+The (media, chart, type) triples in ENTITY_CONFIG were verified live on 2026-05-30
+to return 200 with catalog metadata for the US storefront. The research handoff's
+feed-type names were partly stale (e.g. `top-grossing` 404s, `coming-soon`/`top-songs`
+do not exist as URL segments); the authoritative current set is encoded below.
 
 Snapshot-only source: each response is the *current* chart ranking, no history.
 Apple publishes no historical rankings, so this fetch fn overwrites a fresh
@@ -18,10 +17,12 @@ Delta append turns the daily re-fetches into a time series. There is no
 incremental filter to exploit and nothing to watermark — full re-pull is the
 only correct shape (see "Choose your fetch shape", option 1).
 
-Each entity-union entry is one chart family (one `type`), fetched across all
-storefronts and all charts Apple exposes for that type. Item fields drift across
-media (artistId/artistUrl/releaseDate/contentAdvisoryRating come and go, `genres`
-is a nested list) so raw is written as NDJSON, not parquet.
+Scope: each entity is one chart family, fetched across a curated set of ~40 major
+storefronts (research suggested "top ~30 countries"). The full ~155-storefront
+corpus was deliberately NOT enumerated — at 2 req/s it produced sustained 503s
+under burst, and the marginal coverage of long-tail storefronts is low. Item
+fields drift across media (artistId/artistUrl/releaseDate/contentAdvisoryRating
+come and go, `genres` is a nested list) so raw is written as NDJSON, not parquet.
 """
 
 from datetime import datetime, timezone
@@ -37,43 +38,37 @@ from tenacity import (
 
 from subsets_utils import NodeSpec, get, save_raw_ndjson
 
-# --- chart catalog (entity -> media/type and the charts Apple exposes for it) ---
-# Discovered live from the RSS generator's /types and /feeds endpoints; charts
-# vary by media. music albums/songs/videos all live under the "most-played"
-# chart, distinguished by `type` (the final URL segment). Re-verify against
-# /apple/{media}/{country}/{type}/feeds if Apple changes the chart set.
+# --- chart catalog (entity -> media + the charts/type-segments Apple exposes) ---
+# Every (media, chart, type) triple below was verified live (200 + items) on the
+# US storefront, 2026-05-30. Re-verify against the generator if Apple changes the
+# chart set. Music albums/songs/music-videos all live under the "most-played"
+# chart, distinguished by the final `type` URL segment.
 ENTITY_CONFIG = {
-    "apps-charts":            {"media": "apps",        "type": "apps",         "charts": ["top-free", "top-paid"]},
-    "audio-books-charts":     {"media": "audio-books", "type": "audio-books",  "charts": ["top"]},
-    "books-charts":           {"media": "books",       "type": "books",        "charts": ["top-free", "top-paid"]},
-    "music-albums-charts":    {"media": "music",       "type": "albums",       "charts": ["most-played"]},
-    "music-songs-charts":     {"media": "music",       "type": "songs",        "charts": ["most-played"]},
-    "music-videos-charts":    {"media": "music",       "type": "music-videos", "charts": ["most-played"]},
-    "podcast-episodes-charts":{"media": "podcasts",    "type": "podcast-episodes", "charts": ["top"]},
-    "podcasts-charts":        {"media": "podcasts",    "type": "podcasts",     "charts": ["top", "top-subscriber"]},
+    "apps-charts":             {"media": "apps",        "type": "apps",            "charts": ["top-free", "top-paid"]},
+    "audio-books-charts":      {"media": "audio-books", "type": "audio-books",     "charts": ["top"]},
+    "books-charts":            {"media": "books",       "type": "books",           "charts": ["top-free", "top-paid"]},
+    "music-albums-charts":     {"media": "music",       "type": "albums",          "charts": ["most-played"]},
+    "music-songs-charts":      {"media": "music",       "type": "songs",           "charts": ["most-played"]},
+    "music-videos-charts":     {"media": "music",       "type": "music-videos",    "charts": ["most-played"]},
+    "podcast-episodes-charts": {"media": "podcasts",    "type": "podcast-episodes", "charts": ["top"]},
+    "podcasts-charts":         {"media": "podcasts",    "type": "podcasts",        "charts": ["top"]},
 }
 
-# ISO 3166-1 alpha-2 storefront codes, pulled live from
-# https://rss.marketingtools.apple.com/apple/{media}/storefronts on 2026-05-30
-# (166 supported storefronts). Not every (country, media, chart) combination
-# exists — missing ones 404 and are skipped per-combination.
+# ~40 major App Store / iTunes storefronts (ISO 3166-1 alpha-2), covering the
+# bulk of catalog/ranking activity. Not every (country, media, chart) exists —
+# missing ones 404 and are skipped per-combination.
 COUNTRIES = [
-    "dz", "ao", "ai", "ag", "ar", "am", "au", "at", "az", "bs", "bh", "bb", "by",
-    "be", "bz", "bj", "bm", "bt", "bo", "ba", "bw", "br", "vg", "bg", "kh", "cm",
-    "ca", "cv", "ky", "td", "cl", "cn", "co", "cr", "hr", "cy", "cz", "ci", "cd",
-    "dk", "dm", "do", "ec", "eg", "sv", "ee", "sz", "fj", "fi", "fr", "ga", "gm",
-    "ge", "de", "gh", "gr", "gd", "gt", "gw", "gy", "hn", "hk", "hu", "is", "in",
-    "id", "iq", "ie", "il", "it", "jm", "jp", "jo", "kz", "ke", "kr", "xk", "kw",
-    "kg", "la", "lv", "lb", "lr", "ly", "lt", "lu", "mo", "mg", "mw", "my", "mv",
-    "ml", "mt", "mr", "mu", "mx", "fm", "md", "mn", "me", "ms", "ma", "mz", "mm",
-    "na", "np", "nl", "nz", "ni", "ne", "ng", "mk", "no", "om", "pa", "pg", "py",
-    "pe", "ph", "pl", "pt", "qa", "cg", "ro", "ru", "rw", "sa", "sn", "rs", "sc",
-    "sl", "sg", "sk", "si", "sb", "za", "es", "lk", "kn", "lc", "vc", "sr", "se",
-    "ch", "tw", "tj", "tz", "th", "to", "tt", "tn", "tm", "tc", "tr", "ae", "ug",
-    "ua", "gb", "uy", "uz", "vu", "ve", "vn", "ye", "zm", "zw",
+    "us", "gb", "ca", "au", "ie", "nz",                          # anglophone
+    "de", "fr", "it", "es", "nl", "se", "no", "dk", "fi",        # W/N europe
+    "ch", "at", "be", "pt", "pl", "ru", "tr",                    # rest of europe
+    "jp", "kr", "cn", "hk", "tw", "sg", "in", "id", "th", "my",  # asia-pacific
+    "ph", "vn",
+    "br", "mx", "ar", "cl", "co",                                # latam
+    "za", "ae", "sa", "il",                                      # mea
 ]
 
-LIMIT = 200  # server accepts arbitrary values; 200 is the documented practical max
+LIMIT = 100  # verified live max: limit=200 returns a deterministic HTTP 500 across
+             # every media; 100 is the largest value the server actually serves.
 BASE = "https://rss.marketingtools.apple.com/api/v2"
 
 # Item fields observed across the media families; kept flat per row. `genres`
@@ -100,11 +95,11 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 class _NotFound(Exception):
-    """Permanent: this (country, media, chart) combination doesn't exist."""
+    """Permanent: this (country, media, chart) combination isn't published."""
 
 
 @sleep_and_retry
-@limits(calls=3, period=1)  # ~3 req/s/process — well under what triggered 503s in probing
+@limits(calls=2, period=1)  # ~2 req/s/process; gentle enough to avoid 503 churn
 def _rate_limited_get(url: str) -> httpx.Response:
     return get(url, timeout=(10.0, 120.0))
 
@@ -112,7 +107,7 @@ def _rate_limited_get(url: str) -> httpx.Response:
 @retry(
     retry=retry_if_exception(_is_transient),
     stop=stop_after_attempt(6),
-    wait=wait_exponential(min=2, max=120),
+    wait=wait_exponential(min=2, max=60),
     reraise=True,
 )
 def _fetch_chart(country: str, media: str, chart: str, item_type: str) -> dict:
@@ -121,8 +116,8 @@ def _fetch_chart(country: str, media: str, chart: str, item_type: str) -> dict:
     url = f"{BASE}/{country}/{media}/{chart}/{LIMIT}/{item_type}.json"
     resp = _rate_limited_get(url)  # rate limit re-applied on every retry attempt
     if resp.status_code == 404:
-        # Genuine "not found" — this storefront/chart pair isn't published. Not
-        # an error; the combination simply doesn't exist for this country.
+        # Genuine "not found" — this storefront/chart pair isn't published for
+        # this country. Not an error; skip the combination.
         raise _NotFound(url)
     resp.raise_for_status()
     return resp.json()
@@ -162,7 +157,7 @@ def fetch_one(node_id: str) -> None:
                 for f in _ITEM_FIELDS:
                     row[f] = item.get(f)
                 rows.append(row)
-        if i % 25 == 0:
+        if i % 10 == 0:
             print(f"[{asset}] {i}/{len(COUNTRIES)} storefronts, {len(rows)} rows so far",
                   flush=True)
 

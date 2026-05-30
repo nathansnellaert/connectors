@@ -10,7 +10,7 @@ shape changing so the ranking/id columns go null.
 from subsets_utils import load_raw_ndjson
 
 # Apple charts are global; even niche media publish for dozens of storefronts.
-# A healthy snapshot spans many countries. Set the floor well below the ~166
+# A healthy snapshot spans many countries. Set the floor well below the ~40
 # storefronts we crawl so a few legitimately-empty markets don't trip it.
 _MIN_COUNTRIES = 10
 _REQUIRED = ("id", "name", "country", "chart", "rank", "media", "type")
