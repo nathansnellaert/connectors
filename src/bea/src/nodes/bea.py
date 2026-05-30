@@ -13,23 +13,32 @@ Freshness gating is the maintain step's job, not ours.
 
 Per-dataset GetData strategy (parameter values discovered live via
 GetParameterValues; never a hardcoded year range). The all-value token for a
-parameter is dataset-specific (e.g. NIPA/GDPbyIndustry use "ALL"; IIP/ITA/
-IntlServSTA use "All"; IntlServTrade uses "AllServiceTypes"/"AllTradeDirections"
-/"AllAffiliations"/"AllCountries"). These were verified live 2026-05-30:
+parameter is dataset-specific (e.g. NIPA/GDPbyIndustry/GDP-by-industry use
+"ALL"; IIP/ITA/IntlServSTA/IntlServTrade use "All" for member params with
+Year="ALL"). These were verified live 2026-05-30:
   - single        : one (or few) GetData calls with all-valued parameters
-                    (GDPbyIndustry, UnderlyingGDPbyIndustry, IntlServSTA, IIP,
-                     ITA — for IIP/ITA the request stays small enough with
-                     Year=ALL that no per-year/per-area loop is needed).
+                    (GDPbyIndustry, IntlServSTA — small enough all-at-once).
   - loop_tablename: GetParameterValues(TableName) then one GetData per table
                     (NIPA, NIUnderlyingDetail, FixedAssets).
   - loop_tableid  : GetParameterValues(TableID) then one GetData per table id
                     (InputOutput).
+  - loop_tableid_gdp: GDPbyIndustry-family per-table sweep — one GetData per
+                    (TableID, frequency) with Industry=ALL/Year=ALL
+                    (UnderlyingGDPbyIndustry: the all-tables request 204s
+                    "Error retrieving GDP by Industry data"; per-table calls
+                    succeed — verified TableID=210 -> 5348 rows).
   - loop_param    : one GetData per value of a single enumerated parameter,
-                    everything else all-valued (IntlServTrade — the API forbids
-                    ALL TypeOfService + ALL AreaOrCountry together AND the
-                    all-services response is truncated, so we pin exactly one
-                    TypeOfService per call to get complete coverage; verified
-                    live: pinning Transport returns ~5.7k rows).
+                    everything else all-valued (IntlServTrade — the API silently
+                    returns 0 rows for ALL TypeOfService + ALL AreaOrCountry, so
+                    pin one TypeOfService per call with TradeDirection/
+                    Affiliation/AreaOrCountry="All", Year="ALL"; verified live:
+                    one service returns ~4.9k rows).
+  - loop_param_freq: one GetData per (param value, frequency) (IIP — GetData
+                    rejects TypeOfInvestment=All together with Year=ALL
+                    ["exactly one TypeOfInvestment OR one Year"], so pin one
+                    TypeOfInvestment with Year=ALL; verified -> 188 rows/call).
+  - loop_area     : one GetData per AreaOrCountry value (ITA — API forbids ALL
+                    Indicator + ALL AreaOrCountry together).
   - mne           : DirectionOfInvestment x Classification x Year. MNE GetData
                     REQUIRES SeriesID/OwnershipLevel/NonbankAffiliatesOnly (the
                     prior omission caused APIErrorCode 40 on every combo); with
@@ -130,21 +139,32 @@ DATASET_STRATEGY = {
         "freqs": ["A", "Q"],
     },
     "UnderlyingGDPbyIndustry": {
-        "mode": "single",
-        "base": {"TableID": "ALL", "Industry": "ALL", "Year": "ALL"},
+        # The all-at-once request (TableID=ALL + Industry=ALL + Year=ALL) is too
+        # large for this dataset: BEA returns APIErrorCode 204 "Error retrieving
+        # GDP by Industry data" and never completes it, even on retry (verified —
+        # this was the prior failure; the smaller sibling GDPbyIndustry succeeds
+        # all-at-once). Split per TableID instead. Verified: TableID=210 +
+        # Industry=ALL + Year=ALL + Frequency=A returned 5348 rows.
+        "mode": "loop_tableid_gdp",
         "freqs": ["A", "Q"],
     },
     "IntlServTrade": {
-        # API rejects ALL TypeOfService + ALL AreaOrCountry together and the
-        # all-services response is truncated, so pin one TypeOfService per call
-        # (the rest all-valued) for complete coverage. Tokens are the documented
-        # AllValue strings for this dataset (NOT "ALL").
+        # The AllValue for EVERY IntlServTrade parameter is the literal "ALL"
+        # (verified live via GetParameterList 2026-05-30); the earlier tokens
+        # "AllTradeDirections"/"AllAffiliations"/"AllCountries" are specific
+        # member values, not all-selectors, so the API accepted them but matched
+        # zero rows (the prior run logged 0 rows across all 117 calls, 0 errors).
+        # The dataset has no Frequency parameter. Pin one TypeOfService per call
+        # (its all-token is also "ALL", but the all-services row is an aggregate
+        # we get by looping every service) with the other three params all-valued.
+        # Verified: TypeOfService=AccountAuditBookkeep + TradeDirection=All +
+        # Affiliation=All + AreaOrCountry=All + Year=ALL returned 4888 rows.
         "mode": "loop_param",
         "param": "TypeOfService",
         "base": {
-            "TradeDirection": "AllTradeDirections",
-            "Affiliation": "AllAffiliations",
-            "AreaOrCountry": "AllCountries",
+            "TradeDirection": "All",
+            "Affiliation": "All",
+            "AreaOrCountry": "All",
             "Year": "ALL",
         },
     },
@@ -159,10 +179,16 @@ DATASET_STRATEGY = {
         },
     },
     "IIP": {
-        "mode": "single",
-        # Verified: TypeOfInvestment=All + Component=All + Year=ALL returns the
-        # full history in one call per frequency (no per-year loop needed).
-        "base": {"TypeOfInvestment": "All", "Component": "All", "Year": "ALL"},
+        # IIP GetData rejects TypeOfInvestment=All together with Year=ALL:
+        # "Either exactly one TypeOfInvestment must be requested or exactly one
+        # Year must be requested" (verified live — this killed all 3 prior
+        # calls). So pin one TypeOfInvestment per call and keep Year=ALL.
+        # Verified: TypeOfInvestment=CurrAndDepAssets + Component=All +
+        # Frequency=A + Year=ALL returned 188 rows. TypeOfInvestment has ~399
+        # values; looped across the 3 frequencies that is the full corpus.
+        "mode": "loop_param_freq",
+        "param": "TypeOfInvestment",
+        "base": {"Component": "All", "Year": "ALL"},
         "freqs": ["A", "QNSA", "QSA"],
     },
     "ITA": {
@@ -362,6 +388,26 @@ def _plan_calls(dataset: str, strat: dict) -> list[dict]:
             {**strat["base"], param: code}
             for code in _param_codes(dataset, param)
         ]
+    if mode == "loop_param_freq":
+        # One GetData per (param value, frequency): used when the API forbids an
+        # all-valued param alongside Year=ALL (IIP), so we pin the param and keep
+        # Year=ALL, sweeping each frequency.
+        param = strat["param"]
+        freqs = strat["freqs"]
+        calls = []
+        for code in _param_codes(dataset, param):
+            for f in freqs:
+                calls.append({**strat["base"], param: code, "Frequency": f})
+        return calls
+    if mode == "loop_tableid_gdp":
+        # GDPbyIndustry-family per-table sweep: one GetData per (TableID, freq)
+        # with Industry=ALL/Year=ALL, used when the all-tables request is too big
+        # and 204s (UnderlyingGDPbyIndustry).
+        return [
+            {"TableID": code, "Industry": "ALL", "Year": "ALL", "Frequency": f}
+            for code in _param_codes(dataset, "TableID")
+            for f in strat["freqs"]
+        ]
     if mode == "loop_area":
         areas = [a for a in _param_codes(dataset, "AreaOrCountry") if a != "AllCountries"]
         return [
@@ -388,7 +434,17 @@ def _fetch_planned(asset: str, dataset: str, strat: dict) -> int:
     errors = 0
     with raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip") as fh:
         for i, params in enumerate(calls, 1):
-            js = _api({"method": "GetData", "datasetname": dataset, **params})
+            try:
+                js = _api({"method": "GetData", "datasetname": dataset, **params})
+            except _BeaRetry as e:
+                # A transient envelope error (e.g. 204 "being generated") that
+                # never resolved across the full backoff. Skip this single call
+                # rather than failing the whole dataset; error-paced like a
+                # permanent envelope error so we stay under BEA's 30/min cap.
+                errors += 1
+                print(f"  [{dataset}] persistent transient error on {params}: {e}", flush=True)
+                time.sleep(_ERROR_SLEEP)
+                continue
             data, err = _results_data(js)
             if err:
                 errors += 1

@@ -6,31 +6,22 @@ file-existence alone misses: empty payloads, truncated downloads, a surface
 that quietly switched away from the Bundesbank-CSV ZIP format, error JSON saved
 as data.
 
-Coverage note: four union dataflows (BBBK13, BBBK20, BBDG1, BBXP1) exist in the
-BBK metadata catalog but publish no observations, so /rest/data 404s for them
-and the node writes no raw asset by design. Those — and only those — are
-allowed to be absent.
+Coverage note: four dataless dataflows (BBBK13, BBBK20, BBDG1, BBXP1) that
+exist only in the BBK metadata catalog (no observations, /rest/data 404s on
+every surface) were pruned from the collect catalog, so they are NOT in the
+entity union. Every spec in `spec_ids` is therefore a data-bearing flow and
+must produce a valid ZIP — none are allowed to be absent.
 """
 import io
 import zipfile
 
 from subsets_utils import load_raw_file, raw_asset_exists
 
-# Dataflows that exist in metadata but publish no data (permanent 404 on
-# /rest/data). Confirmed live during authoring. These specs legitimately
-# produce no raw asset.
-KNOWN_DATALESS = {
-    "bundesbank-bbbk13",
-    "bundesbank-bbbk20",
-    "bundesbank-bbdg1",
-    "bundesbank-bbxp1",
-}
-
 
 def test_raw_assets_present_and_valid(spec_ids):
-    """Every spec that should have data must hold a valid, non-empty ZIP with
-    at least one data-bearing CSV member; only the known-dataless flows may be
-    absent, and no *unexpected* flow may be missing."""
+    """Every spec must hold a valid, non-empty ZIP with at least one
+    data-bearing CSV member. After pruning the dataless flows there is no
+    allowed-absent set — any missing asset is a real failure."""
     missing = []
     for sid in spec_ids:
         if not raw_asset_exists(sid, ext="zip"):
@@ -54,19 +45,18 @@ def test_raw_assets_present_and_valid(spec_ids):
                 f"{sid}: all CSV members are empty/stub-sized"
             )
 
-    unexpected = sorted(set(missing) - KNOWN_DATALESS)
-    assert not unexpected, (
-        f"{len(unexpected)} spec(s) missing raw assets beyond the known "
-        f"dataless set: {unexpected}"
+    assert not missing, (
+        f"{len(missing)} spec(s) missing raw assets (all should be "
+        f"data-bearing after pruning): {sorted(missing)}"
     )
 
 
 def test_coverage_threshold(spec_ids):
-    """Sanity floor: the overwhelming majority of specs must have data. Guards
-    against a silent mass failure that nonetheless left the DAG green."""
+    """Sanity floor: essentially every spec must have data. Guards against a
+    silent mass failure that nonetheless left the DAG green. The pruned union
+    is all data-bearing, so expect full coverage."""
     present = sum(1 for sid in spec_ids if raw_asset_exists(sid, ext="zip"))
-    # 86 specs, 4 known dataless -> expect 82 present.
-    assert present >= 80, (
+    assert present == len(spec_ids), (
         f"only {present}/{len(spec_ids)} specs have raw assets — "
-        "expected ~82 (86 minus 4 known-dataless flows)"
+        "expected full coverage of the pruned (all data-bearing) union"
     )

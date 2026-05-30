@@ -27,13 +27,18 @@ series keys plus per-series *_FLAGS, rows = time periods preceded by metadata
 rows; ';' separator). Schemas differ per dataflow, so raw is stored as opaque
 ZIP bytes (save_raw_file) and the transform step owns parsing.
 
-Dataless flows: four union dataflows (BBBK13, BBBK20, BBDG1, BBXP1) exist in
-the BBK metadata catalog but publish no observations — /rest/data/{flow}
-returns a generic HTTP 404 ("keine ... passenden Ergebnisse"). These are
-permanent no-data conditions, not crawl bugs, so fetch_one swallows the 404,
-records a TTL-bound skip marker, and returns cleanly rather than failing the
-DAG. They are re-attempted every refresh (a 404 is instant and cheap) so the
-flow self-heals the moment Bundesbank starts publishing data for it.
+Dataless flows: four catalogued dataflows (BBBK13, BBBK20, BBDG1, BBXP1)
+exist in the BBK metadata catalog but publish no observations — /rest/data
+returns a generic HTTP 404 ("keine ... passenden Ergebnisse") on every
+surface (ZIP and plain CSV alike). They were pruned from the collect catalog
+(an over-enumeration of publishable subsets) and are therefore NOT in this
+step's entity union — the 82 ids below are exactly the data-bearing flows.
+
+fetch_one still defensively classifies a permanent 4xx (non-429) as a
+per-entity skip — TTL marker + clean return rather than failing the whole
+DAG — so a flow that goes dataless *between* refreshes degrades gracefully
+instead of hard-failing its siblings. On a healthy run against the pruned
+union this branch does not fire.
 
 Fetch shape: stateless full re-pull. Each dataflow is re-fetched whole every
 refresh — overwriting the previous snapshot — which picks up revisions and
@@ -66,19 +71,21 @@ ZIP_ACCEPT = "application/vnd.bbk.data+csv-zip;version=1.0.0"
 # observability — gating doesn't depend on it since a 404 is instant.
 SKIP_TTL_SECONDS = 14 * 86400
 
-# The entity union (authoritative coverage target) — 86 SDMX dataflow ids,
-# copied verbatim from entity_union.json. Each maps to one download spec.
+# The entity union (authoritative coverage target) — 82 SDMX dataflow ids,
+# copied verbatim from entity_union.json after pruning the four dataless flows
+# (BBBK13, BBBK20, BBDG1, BBXP1) from the collect catalog. Each maps to one
+# download spec.
 ENTITY_IDS = [
     "BBAF3", "BBAI3", "BBAPV", "BBASV", "BBBEK1", "BBBEK2", "BBBEK3", "BBBEK4",
-    "BBBEK5", "BBBK1", "BBBK10", "BBBK11", "BBBK12", "BBBK13", "BBBK2", "BBBK20",
+    "BBBEK5", "BBBK1", "BBBK10", "BBBK11", "BBBK12", "BBBK2",
     "BBBK3", "BBBK4", "BBBK5", "BBBK6", "BBBK7", "BBBK8", "BBBK9", "BBBP1",
-    "BBBPS", "BBBS2", "BBBU2", "BBBZ1", "BBDA1", "BBDB2", "BBDE1", "BBDG1",
+    "BBBPS", "BBBS2", "BBBU2", "BBBZ1", "BBDA1", "BBDB2", "BBDE1",
     "BBDL1", "BBDP1", "BBDR1", "BBDY1", "BBDZ1", "BBEE1", "BBEE5", "BBEX3",
     "BBFBOPV", "BBFEPOEV", "BBFFDIPV", "BBFFDITV", "BBFI1", "BBGFS1", "BBIB1",
     "BBIG1", "BBIM1", "BBIN1", "BBK10", "BBMF1", "BBMFK1", "BBMMB", "BBMME",
     "BBMMS", "BBMMU", "BBNZ1", "BBSAP", "BBSDI", "BBSDP", "BBSEI", "BBSF2",
     "BBSF3", "BBSHI", "BBSIS", "BBSSY", "BBUMF", "BBWCAF1", "BBXE1", "BBXF1",
-    "BBXL3", "BBXN1", "BBXP1", "BBXP2", "BBXS1", "BBZVS01", "BBZVS02", "BBZVS03",
+    "BBXL3", "BBXN1", "BBXP2", "BBXS1", "BBZVS01", "BBZVS02", "BBZVS03",
     "BBZVS04", "BBZVS05", "BBZVS06", "BBZVS08", "BBZVS11", "BBZVS12", "BBZVSSSI",
 ]
 
