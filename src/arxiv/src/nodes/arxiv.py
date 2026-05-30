@@ -45,7 +45,15 @@ from tenacity import (
     wait_exponential,
 )
 
-from subsets_utils import NodeSpec, get, load_state, raw_writer, save_state
+from subsets_utils import (
+    NodeSpec,
+    delete_raw_file,
+    get,
+    list_raw_files,
+    load_state,
+    raw_writer,
+    save_state,
+)
 
 # --- Bump when the watermark/state contract changes (keys or cursor shape). ---
 STATE_VERSION = 1
@@ -172,22 +180,77 @@ def _parse_record(rec) -> dict:
     return row
 
 
-def _harvest_month(asset: str, frm: str, until: str) -> int:
-    """Harvest one [frm, until] datestamp window, streaming to one NDJSON batch.
+def _next_month(year: int, month: int) -> tuple[int, int]:
+    return (year + 1, 1) if month == 12 else (year, month + 1)
 
-    Returns the number of records written. Writes nothing (creates no file) for
-    an empty window. Pages via resumptionToken until exhausted.
+
+def _save_progress(node_id, year, month, token, part, stats):
+    """Persist a mid-month resume point. Raw is always written before this."""
+    save_state(
+        node_id,
+        {
+            "schema_version": STATE_VERSION,
+            "year": year,
+            "month": month,
+            "token": token,
+            "part": part,
+            "last_run_stats": stats,
+        },
+    )
+
+
+def _harvest_month(node_id, year, month, token, start_part, deadline, stats):
+    """Harvest one month's datestamp window into NDJSON part files.
+
+    Pages via resumptionToken. A month is split across `-pNNN` part files once a
+    part reaches RECORDS_PER_PART; on the per-run budget deadline it checkpoints
+    (closes the open part, saves the resume token + next part index) and stops.
+
+    Args:
+        token: resumptionToken to resume an in-progress month, or None to start
+            the [from, until] window fresh.
+        start_part: index of the first part file to (re)open this call.
+
+    Returns (completed, records): `completed` False means we stopped on the
+    budget mid-month and state has already been saved for resume.
     """
-    params = {
-        "verb": "ListRecords",
-        "metadataPrefix": METADATA_PREFIX,
-        "from": frm,
-        "until": until,
-    }
-    n = 0
+    frm = f"{year}-{month:02d}-01"
+    if frm < EARLIEST_DATESTAMP:
+        frm = EARLIEST_DATESTAMP  # repository rejects earlier `from` values
+    last_day = calendar.monthrange(year, month)[1]
+    until = f"{year}-{month:02d}-{last_day:02d}"
+
+    if token:
+        params = {"verb": "ListRecords", "resumptionToken": token}
+    else:
+        # Fresh (non-resume) harvest of this month: clear any part files left by a
+        # previous, possibly larger, harvest of the same month so no stale higher
+        # part lingers if the month shrank (records modified into a later month).
+        for path in list_raw_files(f"{node_id}-{year}-{month:02d}-p*.ndjson.gz"):
+            name = path.rsplit("/", 1)[-1]
+            delete_raw_file(name[: -len(".ndjson.gz")], "ndjson.gz")
+        params = {
+            "verb": "ListRecords",
+            "metadataPrefix": METADATA_PREFIX,
+            "from": frm,
+            "until": until,
+        }
+
+    part = start_part
+    records = 0
     pages = 0
-    writer_cm = None
-    handle = None
+    cur_cm = None
+    cur_handle = None
+    cur_count = 0
+
+    def _close_part():
+        nonlocal cur_cm, cur_handle, cur_count
+        if cur_cm is not None:
+            cur_cm.__exit__(None, None, None)
+            cur_cm = None
+            cur_handle = None
+            cur_count = 0
+
     try:
         while True:
             root = _request(params)
@@ -195,54 +258,79 @@ def _harvest_month(asset: str, frm: str, until: str) -> int:
             err = root.find(f".//{{{OAI_NS}}}error")
             if err is not None:
                 code = err.get("code")
-                if code == "noRecordsMatch":
-                    break  # empty window — normal for sparse early months
-                if code == "badArgument" and "start date too early" in (err.text or ""):
-                    # Window precedes the repository earliest_datestamp — nothing
-                    # to harvest here. Treat as empty rather than failing the run.
-                    break
+                if code == "noRecordsMatch" or (
+                    code == "badArgument" and "start date too early" in (err.text or "")
+                ):
+                    break  # empty/exhausted window — month complete
                 # cannotDisseminateFormat / other badArgument / badVerb are our
                 # bug, not a source outage — surface loudly.
-                raise RuntimeError(f"OAI error '{code}' for {asset}: {err.text}")
+                raise RuntimeError(f"OAI error '{code}' for {node_id} {frm}: {err.text}")
 
-            records = root.findall(f".//{{{OAI_NS}}}record")
-            if records and handle is None:
-                writer_cm = raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip")
-                handle = writer_cm.__enter__()
-            for rec in records:
-                handle.write(json.dumps(_parse_record(rec), separators=(",", ":")))
-                handle.write("\n")
-                n += 1
+            for rec in root.findall(f".//{{{OAI_NS}}}record"):
+                if cur_handle is None:
+                    asset = f"{node_id}-{year}-{month:02d}-p{part:03d}"
+                    cur_cm = raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip")
+                    cur_handle = cur_cm.__enter__()
+                    cur_count = 0
+                cur_handle.write(json.dumps(_parse_record(rec), separators=(",", ":")))
+                cur_handle.write("\n")
+                records += 1
+                cur_count += 1
 
             pages += 1
             if pages % LOG_EVERY_PAGES == 0:
-                print(f"  {asset}: {pages} pages, {n:,} records...", flush=True)
-            if pages > MAX_PAGES_PER_BUCKET:
+                print(
+                    f"  {node_id} {year}-{month:02d}: {pages} pages, "
+                    f"{records:,} records...",
+                    flush=True,
+                )
+            if pages > MAX_PAGES_PER_RUN:
                 raise RuntimeError(
-                    f"{asset}: exceeded {MAX_PAGES_PER_BUCKET} pages — source grew "
-                    "beyond expectations; refusing to truncate silently."
+                    f"{node_id} {year}-{month:02d}: exceeded {MAX_PAGES_PER_RUN} "
+                    "pages in one run — source grew beyond expectations."
                 )
 
-            tok = root.find(f".//{{{OAI_NS}}}resumptionToken")
-            if tok is None or not (tok.text and tok.text.strip()):
-                break  # last page
-            params = {"verb": "ListRecords", "resumptionToken": tok.text}
+            tok_el = root.find(f".//{{{OAI_NS}}}resumptionToken")
+            tok = (
+                tok_el.text
+                if tok_el is not None and tok_el.text and tok_el.text.strip()
+                else None
+            )
+            if tok is None:
+                break  # last page — month complete
+
+            # Roll to a new part file once the open part is full.
+            if cur_count >= RECORDS_PER_PART:
+                _close_part()
+                part += 1
+                _save_progress(node_id, year, month, tok, part, stats)
+
+            # Budget exhausted — checkpoint and stop mid-month.
+            if time.monotonic() > deadline:
+                _close_part()
+                next_part = part + 1 if records else part
+                _save_progress(node_id, year, month, tok, next_part, stats)
+                print(
+                    f"  {node_id}: hit per-run budget mid {year}-{month:02d}; "
+                    "resuming next refresh.",
+                    flush=True,
+                )
+                return False, records
+
+            params = {"verb": "ListRecords", "resumptionToken": tok}
             time.sleep(PACE_SECONDS)
     finally:
-        if writer_cm is not None:
-            writer_cm.__exit__(None, None, None)
-    return n
+        _close_part()
 
-
-def _next_month(year: int, month: int) -> tuple[int, int]:
-    return (year + 1, 1) if month == 12 else (year, month + 1)
+    return True, records
 
 
 def fetch_papers(node_id: str) -> None:
-    """Harvest a bounded slice of monthly batches, advancing the watermark.
+    """Harvest a bounded slice of the corpus as monthly NDJSON part files.
 
     node_id is the spec id ("arxiv-papers"); it is the state key and the prefix
-    for the per-month raw assets (`arxiv-papers-YYYY-MM`).
+    for the per-month part assets (`arxiv-papers-YYYY-MM-pNNN`). State carries the
+    current (year, month) plus a within-month resume token + part index.
     """
     state = load_state(node_id)
     if state.get("schema_version") not in (None, STATE_VERSION):
@@ -253,11 +341,14 @@ def fetch_papers(node_id: str) -> None:
         )
         state = {}
 
-    watermark = state.get("watermark")  # "YYYY-MM" of the next month to harvest
-    if watermark:
-        year, month = (int(p) for p in watermark.split("-"))
+    year = state.get("year")
+    if year:
+        month = state["month"]
+        token = state.get("token")
+        part = state.get("part", 0)
     else:
         year, month = SOURCE_MIN_YEAR, SOURCE_MIN_MONTH
+        token, part = None, 0
 
     today = date.today()  # frozen for this run
     current = (today.year, today.month)
@@ -268,53 +359,46 @@ def fetch_papers(node_id: str) -> None:
 
     while (year, month) <= current:
         if time.monotonic() > deadline:
-            print(
-                f"  {node_id}: hit per-run budget at {year}-{month:02d}; "
-                "resuming next refresh.",
-                flush=True,
-            )
-            break
+            _save_progress(node_id, year, month, token, part, _stats(months_done, records_total, year, month, today))
+            print(f"  {node_id}: hit per-run budget at {year}-{month:02d} boundary; "
+                  "resuming next refresh.", flush=True)
+            return
 
-        frm = f"{year}-{month:02d}-01"
-        if frm < EARLIEST_DATESTAMP:
-            frm = EARLIEST_DATESTAMP  # repository rejects earlier `from` values
-        last_day = calendar.monthrange(year, month)[1]
-        until = f"{year}-{month:02d}-{last_day:02d}"
-        asset = f"{node_id}-{year}-{month:02d}"
-
-        n = _harvest_month(asset, frm, until)
-        months_done += 1
+        stats = _stats(months_done, records_total, year, month, today)
+        completed, n = _harvest_month(node_id, year, month, token, part, deadline, stats)
         records_total += n
-        print(f"  {node_id}: {year}-{month:02d} -> {n:,} records", flush=True)
+        if not completed:
+            return  # checkpoint already saved inside _harvest_month
 
-        is_closed = (year, month) < current
-        nxt_year, nxt_month = _next_month(year, month)
-        # Write raw FIRST (done above), then advance state.
-        if is_closed:
-            # Past month is immutable now — advance the watermark past it.
-            new_watermark = f"{nxt_year}-{nxt_month:02d}"
+        months_done += 1
+        token, part = None, 0  # next month starts fresh
+        print(f"  {node_id}: {year}-{month:02d} complete -> {n:,} records", flush=True)
+
+        if (year, month) < current:
+            # Past month is immutable now — advance to the next month.
+            year, month = _next_month(year, month)
+            _save_progress(node_id, year, month, None, 0,
+                           _stats(months_done, records_total, year, month, today))
         else:
-            # Current month stays open so the next run re-harvests it (overlap).
-            new_watermark = f"{year}-{month:02d}"
-        save_state(
-            node_id,
-            {
-                "schema_version": STATE_VERSION,
-                "watermark": new_watermark,
-                "last_run_stats": {
-                    "months": months_done,
-                    "records": records_total,
-                    "through": f"{year}-{month:02d}",
-                    "ran_on": today.isoformat(),
-                },
-            },
-        )
-        year, month = nxt_year, nxt_month
+            # Current (open) month done — reset so the next run re-harvests it
+            # (overlap that catches late same-month modifications), then stop.
+            _save_progress(node_id, year, month, None, 0,
+                           _stats(months_done, records_total, year, month, today))
+            break
 
     print(
         f"  {node_id}: run complete — {months_done} months, {records_total:,} records.",
         flush=True,
     )
+
+
+def _stats(months, records, year, month, today):
+    return {
+        "months_this_run": months,
+        "records_this_run": records,
+        "through": f"{year}-{month:02d}",
+        "ran_on": today.isoformat(),
+    }
 
 
 DOWNLOAD_SPECS = [
