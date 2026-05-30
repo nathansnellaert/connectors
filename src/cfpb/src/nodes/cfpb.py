@@ -219,30 +219,75 @@ def _stream_csv_to_parquet(url: str, params: dict, asset: str, schema: pa.Schema
     return n_rows
 
 
+# A single streamed GET of the ~6.8GB nationwide CSV is unreliable: the
+# files.ffiec.cfpb.gov origin reliably drops the connection partway through
+# (observed peer-close at ~1.46GB of 6.8GB), and retrying the whole body from
+# scratch never lands. The server supports HTTP Range (Accept-Ranges: bytes,
+# verified 2026-05-31), so the file is pulled in bounded chunks instead — each
+# chunk small enough that a mid-chunk drop costs a cheap re-fetch, not a 6GB
+# restart, and already-written chunks are never re-pulled.
+LOAN_CHUNK_BYTES = 32 << 20  # 32 MiB per Range request
+
+
+def _resolve_csv(url: str, params: dict) -> tuple:
+    """Follow the 301 redirect to files.ffiec.cfpb.gov and read the total size.
+
+    A ``Range: bytes=0-0`` probe returns 206 with a ``Content-Range`` header of
+    the form ``bytes 0-0/<total>`` and ``resp.url`` set to the final file URL.
+    """
+    headers = {**_CSV_HEADERS, "Range": "bytes=0-0"}
+    resp = get(url, params=params, headers=headers, timeout=(15.0, 120.0))
+    resp.raise_for_status()
+    cr = resp.headers.get("content-range", "")
+    if "/" not in cr:
+        raise RuntimeError(f"no Content-Range for {url} {params}: {cr!r}")
+    total = int(cr.rsplit("/", 1)[1])
+    return str(resp.url), total
+
+
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(min=4, max=120),
+    stop=stop_after_attempt(8),
+    wait=wait_exponential(min=2, max=60),
     reraise=True,
 )
-def _stream_to_csv_gz(url: str, params: dict, asset: str) -> int:
-    """Stream a (multi-GB) CSV response straight to a gzip-compressed raw file.
+def _fetch_range(url: str, start: int, end: int) -> bytes:
+    """Fetch the inclusive byte range [start, end] fully into memory.
 
-    Retrying re-opens the writer (truncate), so a transient mid-download
-    failure is idempotent.
+    A short body (the origin closing early) is reclassified as a transient
+    protocol error so tenacity re-fetches just this chunk.
     """
-    client = get_client()
-    n_bytes = 0
-    timeout = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
-    with client.stream("GET", url, params=params, headers=_CSV_HEADERS, timeout=timeout) as resp:
-        resp.raise_for_status()
-        with raw_writer(asset, "csv.gz", mode="wb", compression="gzip") as f:
-            for chunk in resp.iter_bytes(chunk_size=1 << 20):
-                f.write(chunk)
-                n_bytes += len(chunk)
-                if n_bytes % (256 << 20) < (1 << 20):
-                    print(f"[{asset}] streamed ~{n_bytes >> 20} MiB", flush=True)
-    return n_bytes
+    expected = end - start + 1
+    headers = {**_CSV_HEADERS, "Range": f"bytes={start}-{end}"}
+    resp = get(url, headers=headers, timeout=(15.0, 180.0))
+    resp.raise_for_status()
+    data = resp.content
+    if len(data) != expected:
+        raise httpx.RemoteProtocolError(
+            f"short range {start}-{end}: got {len(data)} of {expected} bytes"
+        )
+    return data
+
+
+def _download_csv_ranged_gz(url: str, params: dict, asset: str) -> int:
+    """Download a (multi-GB) CSV via sequential Range chunks into a gzip raw file.
+
+    Each chunk is fetched complete (or retried) before it is written, so the
+    gzip stream never receives a partial chunk. A crash between chunks leaves a
+    truncated file; the next run re-opens the writer (mode='wb' truncates) and
+    re-downloads the whole year — idempotent, just bandwidth.
+    """
+    final_url, total = _resolve_csv(url, params)
+    print(f"[{asset}] {total >> 20} MiB total via {LOAN_CHUNK_BYTES >> 20} MiB ranges", flush=True)
+    offset = 0
+    with raw_writer(asset, "csv.gz", mode="wb", compression="gzip") as f:
+        while offset < total:
+            end = min(offset + LOAN_CHUNK_BYTES, total) - 1
+            f.write(_fetch_range(final_url, offset, end))
+            offset = end + 1
+            if (offset // LOAN_CHUNK_BYTES) % 16 == 0 or offset >= total:
+                print(f"[{asset}] {offset >> 20}/{total >> 20} MiB", flush=True)
+    return offset
 
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +433,7 @@ def fetch_hmda_loans(node_id: str) -> None:
             )
             break
         asset = f"cfpb-hmda-loans-{y}"
-        n_bytes = _stream_to_csv_gz(HMDA_BASE + "view/nationwide/csv", {"years": y}, asset)
+        n_bytes = _download_csv_ranged_gz(HMDA_BASE + "view/nationwide/csv", {"years": y}, asset)
         done.add(y)
         processed += 1
         save_state(state_key, {
