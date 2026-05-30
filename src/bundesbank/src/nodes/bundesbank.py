@@ -14,26 +14,33 @@ dataflow ("Csv time series limit of 200 exceeded. Request same time series
 with content type application/vnd.bbk.data+csv-zip..."). The SDMX-CSV
 whole-dataflow surface works but is enormous uncompressed (BBEX3 alone is
 ~2.3 GB of text). The ZIP variant is the only path that returns the *entire*
-dataflow in one bounded, compressed payload (BBEX3 = 8.8 MB zip / 111 MB
-across 19 member CSVs; smaller flows are tens of KB).
+dataflow in one bounded, compressed payload. Probed sizes: most flows are tens
+to hundreds of KB; BBEX3 = 8.8 MB / 19 members; BBBK1 = 13.7 MB (largest seen,
+~64 s cold generation, sub-second when server-cached). All comfortably inside
+the 300 s read timeout (httpx read timeout is per-chunk, not total).
 
 Each ZIP holds one-or-more member CSVs in Bundesbank's wide layout (columns =
 series keys plus per-series *_FLAGS, rows = time periods preceded by metadata
 rows; ';' separator). Schemas differ per dataflow, so raw is stored as opaque
 ZIP bytes (save_raw_file) and the transform step owns parsing.
 
-Fetch shape: stateless full re-pull. Each dataflow is small-to-moderate as a
-ZIP and is re-fetched whole every refresh — overwriting the previous snapshot.
-This picks up revisions and late corrections for free; there is no usable
-incremental delta surface (only startPeriod/endPeriod date windows, which we
-don't need for a full-corpus snapshot). No auth, no documented rate limit.
+Dataless flows: four union dataflows (BBBK13, BBBK20, BBDG1, BBXP1) exist in
+the BBK metadata catalog but publish no observations — /rest/data/{flow}
+returns a generic HTTP 404 ("keine ... passenden Ergebnisse"). These are
+permanent no-data conditions, not crawl bugs, so fetch_one swallows the 404,
+records a TTL-bound skip marker, and returns cleanly rather than failing the
+DAG. They are re-attempted every refresh (a 404 is instant and cheap) so the
+flow self-heals the moment Bundesbank starts publishing data for it.
 
-Memory note: subsets_utils.get buffers the full response body, so the working
-ceiling per spec is one dataflow's ZIP held in RAM. ZIP compression keeps this
-bounded (single-digit-MB to low-tens-of-MB even for the large flows); read
-timeout is set generously (300 s) because big flows stream slowly.
+Fetch shape: stateless full re-pull. Each dataflow is re-fetched whole every
+refresh — overwriting the previous snapshot — which picks up revisions and
+late corrections for free. There is no usable incremental delta surface (only
+startPeriod/endPeriod date windows, unneeded for a full-corpus snapshot). No
+auth, no documented rate limit (not observed during probing). State is used
+only for the dataless skip markers and per-run stats, never as a watermark.
 """
 import io
+import time
 import zipfile
 
 import httpx
@@ -44,14 +51,20 @@ from tenacity import (
     wait_exponential,
 )
 
-from subsets_utils import NodeSpec, get, save_raw_file
+from subsets_utils import NodeSpec, get, load_state, save_raw_file, save_state
+
+STATE_VERSION = 1
 
 BASE = "https://api.statistiken.bundesbank.de/rest"
 # Bundesbank-CSV-as-ZIP: the only content type that returns a whole dataflow.
 ZIP_ACCEPT = "application/vnd.bbk.data+csv-zip;version=1.0.0"
 
+# Re-attempt a dataless (404) flow at most this often; the marker is for
+# observability — gating doesn't depend on it since a 404 is instant.
+SKIP_TTL_SECONDS = 14 * 86400
+
 # The entity union (authoritative coverage target) — 86 SDMX dataflow ids,
-# copied from entity_union.json. Each maps to one download spec.
+# copied verbatim from entity_union.json. Each maps to one download spec.
 ENTITY_IDS = [
     "BBAF3", "BBAI3", "BBAPV", "BBASV", "BBBEK1", "BBBEK2", "BBBEK3", "BBBEK4",
     "BBBEK5", "BBBK1", "BBBK10", "BBBK11", "BBBK12", "BBBK13", "BBBK2", "BBBK20",
@@ -89,8 +102,10 @@ def _is_transient(exc: BaseException) -> bool:
     reraise=True,
 )
 def _fetch_zip(flow: str) -> bytes:
-    """GET one whole dataflow as a Bundesbank-CSV ZIP. Retries transient faults;
-    4xx (e.g. 404 unknown flow, 406 wrong format) raise straight through."""
+    """GET one whole dataflow as a Bundesbank-CSV ZIP. Transient faults (429,
+    5xx, connect/read timeouts) are retried; permanent 4xx (404 unknown/dataless
+    flow, 406 wrong format) raise an HTTPStatusError straight through for the
+    caller to classify."""
     url = f"{BASE}/data/{flow}"
     resp = get(url, headers={"Accept": ZIP_ACCEPT}, timeout=(10.0, 300.0))
     resp.raise_for_status()
@@ -100,22 +115,54 @@ def _fetch_zip(flow: str) -> bytes:
 def fetch_one(node_id: str) -> None:
     asset = node_id  # the runtime passes the spec id; it IS the asset name
     # Recover the SDMX dataflow id from the spec id. Union ids are uppercase
-    # and underscore-free; the convention maps '_' -> '-', so reverse that.
+    # and underscore-free; the id convention maps '_' -> '-', so reverse that.
     flow = node_id[len("bundesbank-"):].replace("-", "_").upper()
 
-    content = _fetch_zip(flow)
+    try:
+        content = _fetch_zip(flow)
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        # Permanent client error (NOT 429 — that's transient and already
+        # retried). The common case is 404 on a metadata-only flow that
+        # publishes no observations. Record a TTL skip marker and return
+        # cleanly so one dataless flow doesn't fail the whole DAG.
+        if code != 429 and 400 <= code < 500:
+            state = load_state(asset)
+            state["schema_version"] = STATE_VERSION
+            state["skipped"] = {
+                "reason": f"HTTP {code} on /rest/data/{flow} (no published data)",
+                "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
+            }
+            save_state(asset, state)
+            print(
+                f"{flow}: HTTP {code} (no data) -> skipped, no raw written",
+                flush=True,
+            )
+            return
+        raise
 
-    # Honest format check: a healthy response is a non-empty ZIP. An empty body
-    # or a non-ZIP payload means the surface changed silently — fail loudly
-    # rather than persist garbage.
+    # Honest format check: a healthy response is a non-empty ZIP carrying at
+    # least one CSV member. Empty body / non-ZIP / no members means the surface
+    # changed silently — fail loudly rather than persist garbage.
     assert content, f"{flow}: empty response body"
-    assert content[:2] == b"PK", f"{flow}: response is not a ZIP (head={content[:16]!r})"
+    assert content[:2] == b"PK", (
+        f"{flow}: response is not a ZIP (head={content[:16]!r})"
+    )
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        members = zf.namelist()
-        assert members, f"{flow}: ZIP contains no members"
+        members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        assert members, f"{flow}: ZIP contains no .csv members ({zf.namelist()})"
 
     save_raw_file(content, asset, extension="zip")
-    print(f"{flow}: saved {len(content)} zip bytes, {len(members)} member CSV(s)", flush=True)
+
+    state = load_state(asset)
+    state["schema_version"] = STATE_VERSION
+    state.pop("skipped", None)  # recovered: clear any stale dataless marker
+    state["last_run_stats"] = {"bytes": len(content), "csv_members": len(members)}
+    save_state(asset, state)
+    print(
+        f"{flow}: saved {len(content)} zip bytes, {len(members)} member CSV(s)",
+        flush=True,
+    )
 
 
 DOWNLOAD_SPECS = [
