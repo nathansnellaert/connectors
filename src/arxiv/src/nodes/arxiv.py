@@ -4,47 +4,44 @@ Mechanism (chosen by research): OAI-PMH ListRecords, metadataPrefix=arXiv,
 endpoint https://oaipmh.arxiv.org/oai (the post-March-2025 host). One entity:
 `papers` — the full ~2.5M-record arXiv metadata corpus, growing ~20k/month.
 
-== Endpoint behaviour (probed live, 2026-05-28) ==
-The OAI host sits behind Fastly in front of a Google-Frontend origin. Cacheable
-verbs (Identify, ListMetadataFormats) answer instantly from the CDN, but every
-ListRecords/ListIdentifiers request hits the origin and is SLOW: the origin
-generates the response while Fastly's edge times out the first byte (~180s) and
-returns "503 first byte timeout". Crucially the origin keeps working and warms
-the cache, so RETRYING THE IDENTICAL REQUEST succeeds — probing saw a page warm
-on attempt 4 (~200s) or sometimes on attempt 1 (~5-25s). The transient-retry
-decorator on `_fetch_root` is therefore load-bearing, not decorative: a single
-page routinely needs several attempts before the warm 200 lands.
+== Endpoint behaviour (probed live, 2026-05-30) ==
+ListRecords against the new host answers in ~5-6s per page (1300 records/page),
+behind Fastly + a Google-Frontend origin. Cacheable verbs (Identify,
+ListMetadataFormats) answer instantly. The origin can occasionally be slow to
+warm a cold page and Fastly may return a 503 "first byte timeout" — so the
+transient-retry decorator on `_fetch_root` is load-bearing: it retries the
+identical (stateless) request into the now-warmer cache. A read-timeout that
+survives all retries is an EXPECTED, NON-FATAL event for this firehose: the
+crawl flushes what it has, advances state, and returns cleanly; the next run
+resumes. It does NOT fail the spec.
 
-Because warming is intermittent, a read timeout that survives all retries is an
-EXPECTED, NON-FATAL event for this firehose — not a reason to fail the spec.
-The crawl catches transient-retry exhaustion at the top level, flushes whatever
-it has, advances state, and returns cleanly; the next run resumes. (The prior
-implementation let that exception propagate and failed the whole DAG with "read
-operation timed out" — that is the bug this version fixes.)
+== Resumption / watermark (CORRECTED) ==
+arXiv's resumptionToken is transparent and stateless. Its decoded text is:
+    verb=ListRecords&metadataPrefix=arXiv&from=<F'>&until=<U>&skip=<N>
+where F' is an ADVANCING datestamp cursor and N is an offset RELATIVE TO F'
+(NOT relative to the segment's original `from`). Probed live: a page starting
+from=2024-01-01 returns a token from=2024-01-03&skip=77, the next from=2024-01-05
+&skip=343. The token's (from, skip) pair must be carried together — using the
+original segment `from` with the server's `skip` (the prior implementation's
+bug) requests the wrong window and re-reads / corrupts the crawl.
 
-== Resumption / watermark ==
-arXiv's resumptionToken is transparent and stateless: its text is literally
-  verb=ListRecords&metadataPrefix=arXiv&from=<F>&until=<U>&skip=<N>
-i.e. the query plus an integer offset. The server does NOT honour `skip` as a
-direct request parameter (badArgument), but it DOES accept a hand-reconstructed
-token string — verified live — so we can resume from any offset durably. The
-server's tokens carry expirationDate=<next UTC midnight>, but since the token is
-stateless we reconstruct it ourselves and never depend on that expiry. The
-durable watermark is therefore the integer `skip` offset within a date-bounded
-crawl segment.
+The token is replayed by RECONSTRUCTING it from the parsed (from, skip) — verified
+live to return byte-identical records to the server's own token, and independent
+of the server's midnight `expirationDate` (the token is stateless, so a
+hand-built string is honoured regardless of the stamped expiry). The durable
+watermark is therefore the in-progress segment's {from, until, skip}.
 
-Date bounding makes the result set immutable while we crawl it: arXiv orders by
-id, so a crawl with a frozen `until` sees a fixed set (new submissions get a
-datestamp > until and fall outside), keeping offsets stable across the multi-run
-backfill. completeListSize is not reported, so pagination terminates only when a
-page returns no resumptionToken (or noRecordsMatch).
+`until` is frozen at segment start, which makes the result set immutable while we
+crawl it across many bounded runs (new submissions get a datestamp > until and
+fall outside). completeListSize is not reported, so pagination terminates only
+when a page returns no resumptionToken (or noRecordsMatch).
 
-Backfill = one offset crawl over [SOURCE_MIN, T0] (T0 frozen at first run),
-spread across as many bounded runs as the per-run time budget requires. Once a
-segment exhausts, the watermark advances to its `until`; refresh starts a fresh
-segment over [watermark - overlap, today], catching new and re-stamped records
-(datestamp tracks record modification). Overlap duplicates are dedup'd by the
-id-keyed merge in transform — they are the safety, not a bug.
+Backfill = one segment crawl over [SOURCE_MIN, T0] (T0 = the date frozen at the
+first run's `until`), spread across as many bounded per-run budgets as needed.
+When a segment exhausts, the watermark advances to its `until`; the next refresh
+starts a fresh segment over [watermark - overlap, today], catching new and
+re-stamped records (datestamp tracks record modification). Overlap duplicates
+are dedup'd by transform's id-keyed merge — they are the safety, not a bug.
 
 Raw format: NDJSON. Records are nested (authors list) with many optional fields
 (license, doi, journal-ref, msc-class, comments, ...) that come and go across
@@ -72,19 +69,21 @@ from subsets_utils import NodeSpec, get, load_state, save_state, save_raw_ndjson
 ENDPOINT = "https://oaipmh.arxiv.org/oai"
 METADATA_PREFIX = "arXiv"
 SOURCE_MIN = "2005-09-16"          # earliestDatestamp from the Identify verb
-                                   # (it is empty; real records start 2005-09-17)
 
 OVERLAP_DAYS = 7                   # re-harvest tail on refresh (record-mod lag)
-BATCH_SIZE = 50_000                # records buffered per NDJSON file (~25MB zstd)
-MAX_FETCH_SECONDS = 1500           # per-run soft budget; deliberate pacing, fires
-                                   # on every backfill run, returns cleanly
+BATCH_SIZE = 20_000                # records buffered per NDJSON file (~bounded RAM)
+MAX_FETCH_SECONDS = 120            # per-run soft budget; deliberate pacing, fires
+                                   # on every backfill run, returns cleanly. Kept
+                                   # short so the whole connector run finishes well
+                                   # inside the harness's per-step wall-clock — a
+                                   # long budget is what orphaned the prior attempt.
 SLEEP_BETWEEN_PAGES = 1.0          # defensive pacing (OAI has no documented limit)
-MAX_PAGES_PER_RUN = 5000           # hard safety: ~6.5M records (~2.5x corpus). A
-                                   # legit time-bounded run does far fewer; tripping
-                                   # this means the token isn't terminating — raise,
-                                   # don't loop silently.
-STATE_VERSION = 2                  # bumped from 1: watermark contract changed to
-                                   # {watermark, crawl:{from,until,skip}}.
+MAX_PAGES_PER_RUN = 10_000         # hard safety: a time-bounded run does far fewer;
+                                   # tripping this means the token isn't terminating
+                                   # — raise, don't loop silently.
+STATE_VERSION = 3                  # bumped from 2: the resume contract changed —
+                                   # `crawl.from` now tracks the token's ADVANCING
+                                   # cursor, not the segment's original from.
 
 _OAI = "{http://www.openarchives.org/OAI/2.0/}"
 _ARX = "{http://arxiv.org/OAI/arXiv/}"
@@ -116,19 +115,18 @@ def _is_transient(exc: BaseException) -> bool:
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(8),
     wait=wait_exponential(min=3, max=45),
     reraise=True,
 )
 def _fetch_root(params: dict) -> etree._Element:
     """One OAI-PMH request -> parsed XML root. Retried on transient failure.
 
-    Read timeout is 70s: it trips before Fastly's ~180s edge 503, so a cold
+    Read timeout is 90s: it trips before Fastly's ~180s edge 503, so a cold
     (still-warming) request fails fast and we retry into the now-warmer cache
-    rather than burning the budget waiting on a single dead first byte. 10
-    attempts gives headroom — probing saw warm-up take up to ~4 attempts.
+    rather than burning the budget on a single dead first byte.
     """
-    resp = get(ENDPOINT, params=params, timeout=(10.0, 70.0))
+    resp = get(ENDPOINT, params=params, timeout=(10.0, 90.0))
     resp.raise_for_status()
     return etree.fromstring(resp.content)
 
@@ -215,17 +213,35 @@ def _parse_page(root: etree._Element) -> tuple[list[dict], str | None, str | Non
     return rows, token, None
 
 
-def _parse_skip(token_text: str) -> int | None:
-    """Extract the integer `skip` offset from a resumptionToken's text. The
-    token is URL-encoded in the XML (skip%3DN); decode then read skip=N."""
+def _parse_token(token_text: str) -> dict | None:
+    """Decode a resumptionToken into its {from, until, skip} fields. Returns
+    None if the token is malformed (missing the offset). The token is
+    URL-encoded in the XML (skip%3DN&from%3D...); unquote then split."""
     dec = urllib.parse.unquote(token_text)
+    fields: dict[str, str] = {}
     for part in dec.split("&"):
-        if part.startswith("skip="):
-            try:
-                return int(part[5:])
-            except ValueError:
-                return None
-    return None
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k] = v
+    if "skip" not in fields:
+        return None
+    try:
+        skip = int(fields["skip"])
+    except ValueError:
+        return None
+    return {
+        "from": fields.get("from"),
+        "until": fields.get("until"),
+        "skip": skip,
+    }
+
+
+def _reconstruct_token(frm: str, until: str, skip: int) -> str:
+    """Build a stateless resumptionToken string from its components. Verified
+    live to return byte-identical records to the server's own token, and
+    independent of the server's stamped midnight expiry."""
+    return (f"verb=ListRecords&metadataPrefix={METADATA_PREFIX}"
+            f"&from={frm}&until={until}&skip={skip}")
 
 
 # --- date helpers ----------------------------------------------------------
@@ -243,11 +259,11 @@ def _s(d: datetime) -> str:
 def fetch_papers(entity_id: str) -> None:
     """Harvest the arXiv metadata corpus into NDJSON batches.
 
-    Pages a date-bounded crawl segment by reconstructed offset token, writing
-    batches raw-before-state, until the segment exhausts or the per-run budget
-    is spent. A transient-retry exhaustion (the endpoint failing to warm within
-    the retry budget) flushes and returns cleanly — partial progress, resumed
-    next run. State carries the durable `skip` offset plus a date watermark.
+    Pages a date-bounded crawl segment, carrying the token's advancing
+    (from, skip) cursor in state, writing batches raw-before-state, until the
+    segment exhausts or the per-run budget is spent. A transient-retry
+    exhaustion (the endpoint failing to warm within the retry budget) flushes
+    and returns cleanly — partial progress, resumed next run.
     """
     state_key = f"arxiv-{entity_id}"
     state = load_state(state_key)
@@ -272,8 +288,8 @@ def fetch_papers(entity_id: str) -> None:
                if watermark else SOURCE_MIN)
         crawl = {"from": frm, "until": today, "skip": 0}
 
-    seg_from = crawl["from"]
-    seg_until = crawl["until"]
+    seg_until = crawl["until"]                   # frozen for the whole segment
+    cur_from = crawl["from"]                     # advancing cursor (token's `from`)
     skip = int(crawl.get("skip", 0))
 
     # Mutable run accumulators.
@@ -282,10 +298,10 @@ def fetch_papers(entity_id: str) -> None:
     pages = 0
     records = 0
 
-    def flush(cur_skip: int, complete: bool) -> None:
+    def flush(c_from: str, c_skip: int, complete: bool) -> None:
         """Write buffered rows to raw FIRST, then persist state. `complete`
         marks the segment exhausted (advance watermark, clear crawl); otherwise
-        persist the resumable offset for the next run."""
+        persist the resumable advancing (from, skip) for the next run."""
         nonlocal buf, seq
         if buf:
             asset = f"arxiv-{entity_id}-{run_ts}-{seq:04d}"
@@ -303,7 +319,7 @@ def fetch_papers(entity_id: str) -> None:
             new_state = {
                 "schema_version": STATE_VERSION,
                 "watermark": watermark,
-                "crawl": {"from": seg_from, "until": seg_until, "skip": cur_skip},
+                "crawl": {"from": c_from, "until": seg_until, "skip": c_skip},
             }
         new_state["last_success_at"] = datetime.now(tz=timezone.utc).isoformat()
         new_state["last_run_stats"] = {
@@ -311,48 +327,51 @@ def fetch_papers(entity_id: str) -> None:
             "records": records,
             "pages": pages,
             "batches": seq,
-            "segment": [seg_from, seg_until],
-            "skip": cur_skip,
+            "segment": [crawl["from"], seg_until],
+            "resume_from": c_from,
+            "resume_skip": c_skip,
             "complete": complete,
         }
         save_state(state_key, new_state)
 
-    print(f"[{state_key}] crawl segment [{seg_from}, {seg_until}] from skip={skip}",
-          flush=True)
+    print(f"[{state_key}] crawl segment until={seg_until} resume from={cur_from} "
+          f"skip={skip}", flush=True)
 
     try:
         while True:
             if skip == 0:
+                # No within-date offset: a plain {from, until} request is exactly
+                # equivalent to the token from=cur_from&until&skip=0, so use the
+                # raw params (covers both the segment's first page and any later
+                # page whose cursor lands on skip=0 at a new date).
                 params = {"verb": "ListRecords", "metadataPrefix": METADATA_PREFIX,
-                          "from": seg_from, "until": seg_until}
+                          "from": cur_from, "until": seg_until}
             else:
-                # Reconstruct the stateless offset token (durable across the
-                # server's midnight expiry — we never use the server's token).
-                token = (f"verb=ListRecords&metadataPrefix={METADATA_PREFIX}"
-                         f"&from={seg_from}&until={seg_until}&skip={skip}")
-                params = {"verb": "ListRecords", "resumptionToken": token}
+                params = {"verb": "ListRecords",
+                          "resumptionToken": _reconstruct_token(
+                              cur_from, seg_until, skip)}
 
             root = _fetch_root(params)
             rows, next_token, err = _parse_page(root)
 
             if err == "noRecordsMatch":
                 # Empty segment (e.g. a refresh window with no recent changes).
-                flush(skip, complete=True)
+                flush(cur_from, skip, complete=True)
                 print(f"[{state_key}] noRecordsMatch — segment complete", flush=True)
                 return
             if err:
                 # badResumptionToken or any other OAI error is unexpected here
                 # (we reconstruct stateless tokens). Surface it.
                 raise RuntimeError(
-                    f"OAI-PMH error '{err}' for segment [{seg_from},{seg_until}] "
-                    f"skip={skip}")
+                    f"OAI-PMH error '{err}' for segment until={seg_until} "
+                    f"from={cur_from} skip={skip}")
 
             buf.extend(rows)
             records += len(rows)
             pages += 1
             if pages % 10 == 0:
                 print(f"[{state_key}] {pages} pages, {records} records, "
-                      f"skip={skip}", flush=True)
+                      f"from={cur_from} skip={skip}", flush=True)
 
             if pages > MAX_PAGES_PER_RUN:
                 raise RuntimeError(
@@ -361,30 +380,35 @@ def fetch_papers(entity_id: str) -> None:
 
             if next_token is None:
                 # Last page of the segment — corpus range exhausted.
-                flush(skip, complete=True)
+                flush(cur_from, skip, complete=True)
                 print(f"[{state_key}] segment complete: {records} records, "
                       f"{pages} pages, watermark={seg_until}", flush=True)
                 return
 
-            next_skip = _parse_skip(next_token)
-            if next_skip is None:
-                next_skip = skip + len(rows)
-            if next_skip <= skip:
+            parsed = _parse_token(next_token)
+            if parsed is None:
                 raise RuntimeError(
-                    f"resumptionToken offset did not advance "
-                    f"(skip {skip} -> {next_skip}); aborting")
-            skip = next_skip
+                    f"could not parse resumptionToken offset: {next_token!r}")
+            new_from = parsed["from"] or cur_from
+            new_skip = parsed["skip"]
+            # Sanity: the cursor must make forward progress, else we'd loop.
+            if (new_from, new_skip) == (cur_from, skip):
+                raise RuntimeError(
+                    f"resumptionToken did not advance "
+                    f"(from={cur_from} skip={skip}); aborting")
+            cur_from, skip = new_from, new_skip
 
-            # Buffer relief: persist a batch + the live offset mid-crawl.
+            # Buffer relief: persist a batch + the live cursor mid-crawl.
             if len(buf) >= BATCH_SIZE:
-                flush(skip, complete=False)
+                flush(cur_from, skip, complete=False)
 
             if time.monotonic() >= deadline:
-                # Soft budget: stop cleanly with the offset persisted. Expected
+                # Soft budget: stop cleanly with the cursor persisted. Expected
                 # to fire on every backfill run — deliberate pacing, not failure.
-                flush(skip, complete=False)
+                flush(cur_from, skip, complete=False)
                 print(f"[{state_key}] budget reached: {records} records, "
-                      f"{pages} pages, resume at skip={skip}", flush=True)
+                      f"{pages} pages, resume from={cur_from} skip={skip}",
+                      flush=True)
                 return
 
             time.sleep(SLEEP_BETWEEN_PAGES)
@@ -394,17 +418,17 @@ def fetch_papers(entity_id: str) -> None:
         # For this firehose that is expected, non-fatal pacing — flush partial
         # progress and resume next run rather than failing the DAG.
         print(f"[{state_key}] transient exhaustion ({type(exc).__name__}) at "
-              f"skip={skip}; flushing {len(buf)} buffered records and stopping",
-              flush=True)
-        flush(skip, complete=False)
+              f"from={cur_from} skip={skip}; flushing {len(buf)} buffered "
+              f"records and stopping", flush=True)
+        flush(cur_from, skip, complete=False)
         return
     except httpx.HTTPStatusError as exc:
         # A non-transient HTTP status (4xx other than 429) survived retries.
-        # Treat like transient pacing for resume rather than crashing the DAG,
-        # but log loudly so a persistent 4xx is visible in run logs.
-        print(f"[{state_key}] HTTP {exc.response.status_code} at skip={skip} "
-              f"survived retries; flushing and stopping", flush=True)
-        flush(skip, complete=False)
+        # Flush partial progress and stop; log loudly so a persistent 4xx is
+        # visible in run logs rather than crashing the whole DAG.
+        print(f"[{state_key}] HTTP {exc.response.status_code} at from={cur_from} "
+              f"skip={skip} survived retries; flushing and stopping", flush=True)
+        flush(cur_from, skip, complete=False)
         return
 
 
