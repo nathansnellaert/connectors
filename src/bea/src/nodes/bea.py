@@ -11,45 +11,58 @@ Fetch shape: stateless full re-pull (download prompt shape 1). BEA exposes no
 whole corpus and overwrites. Revisions/late corrections are picked up for free.
 Freshness gating is the maintain step's job, not ours.
 
-Per-dataset GetData strategy (discovered live via GetParameterValues; never a
-hardcoded year range):
-  - single        : one (or few) GetData calls with ALL-valued parameters
-                    (GDPbyIndustry, UnderlyingGDPbyIndustry, IntlServTrade,
-                     IntlServSTA).
+Per-dataset GetData strategy (parameter values discovered live via
+GetParameterValues; never a hardcoded year range). The all-value token for a
+parameter is dataset-specific (e.g. NIPA/GDPbyIndustry use "ALL"; IIP/ITA/
+IntlServSTA use "All"; IntlServTrade uses "AllServiceTypes"/"AllTradeDirections"
+/"AllAffiliations"/"AllCountries"). These were verified live 2026-05-30:
+  - single        : one (or few) GetData calls with all-valued parameters
+                    (GDPbyIndustry, UnderlyingGDPbyIndustry, IntlServSTA, IIP,
+                     ITA — for IIP/ITA the request stays small enough with
+                     Year=ALL that no per-year/per-area loop is needed).
   - loop_tablename: GetParameterValues(TableName) then one GetData per table
                     (NIPA, NIUnderlyingDetail, FixedAssets).
   - loop_tableid  : GetParameterValues(TableID) then one GetData per table id
                     (InputOutput).
-  - loop_year     : one GetData per year, all TypeOfInvestment/Component
-                    (IIP — API forbids more than one ALL among
-                     TypeOfInvestment/Year, so we pin Year).
-  - loop_area     : one GetData per AreaOrCountry (except AllCountries),
-                    Indicator=ALL (ITA — API forbids ALL Indicator + ALL
-                    AreaOrCountry together; AreaOrCountry has fewer values).
   - loop_param    : one GetData per value of a single enumerated parameter,
-                    everything else ALL (IntlServTrade — the API forbids ALL
-                    TypeOfService + ALL AreaOrCountry together, so we pin
-                    exactly one TypeOfService per call; verified live 2026-05-30).
-  - mne           : DirectionOfInvestment x Classification, Year=all (verified
-                    live 2026-05-30: the Classification value IS the breakdown
-                    selector, so no extra breakout param is needed — e.g.
-                    inward/CountryByIndustry returns ~220k rows on its own).
-                    Invalid (direction, classification) combos return an
-                    envelope error and are skipped; an error-paced sleep keeps
-                    the spec under BEA's documented 30-errors/minute throttle.
+                    everything else all-valued (IntlServTrade — the API forbids
+                    ALL TypeOfService + ALL AreaOrCountry together AND the
+                    all-services response is truncated, so we pin exactly one
+                    TypeOfService per call to get complete coverage; verified
+                    live: pinning Transport returns ~5.7k rows).
+  - mne           : DirectionOfInvestment x Classification x Year. MNE GetData
+                    REQUIRES SeriesID/OwnershipLevel/NonbankAffiliatesOnly (the
+                    prior omission caused APIErrorCode 40 on every combo); with
+                    SeriesID=0/OwnershipLevel=0/NonbankAffiliatesOnly=0 a single
+                    (direction, classification, year) returns real rows
+                    (verified: outward/Country/2021 ~152k rows). We loop per
+                    year to bound per-call memory and skip invalid
+                    (direction, classification) combos after a single probe so
+                    the permanent-error rate stays well under BEA's 30/min cap.
   - regional_zip  : per-series ZIP bulk export.
 
-Rate limit: BEA documents 100 requests/min PER UserID (global across processes,
-not per-process). The DAG runs nodes sequentially by default (DAG_PARALLELISM=1),
-so a per-process cap of 80/min (~0.75s spacing) keeps the global rate under the
-documented ceiling. 429 means the key is throttled for 1 hour — retries will
-exhaust and surface it as a spec failure rather than silently spinning.
+Transient envelope errors: BEA returns APIErrorCode 204 on a COLD/large GetData
+("result is being generated, retry") — verified live: an all-services
+IntlServTrade call returned 204 on the first hit and the full payload on retry.
+204 (and any "try again"/"being generated" description) is therefore treated as
+TRANSIENT and retried by the tenacity backoff inside `_api`, NOT skipped — the
+prior code skipped all envelope errors, which would silently drop whole tables
+on a fresh CI run. Permanent envelope errors (e.g. 40 = invalid param combo)
+are surfaced to the caller, which skips that single call (error-paced).
+
+Rate / bandwidth limits (documented per UserID, GLOBAL across processes):
+100 requests/min, 100MB/min, 30 errors/min; exceeding any throttles the key for
+1 hour. The DAG runs nodes sequentially (DAG_PARALLELISM=1) so a per-process
+cap of 80 req/min (~0.75s spacing) keeps requests under the ceiling, a rolling
+80MB/min byte budget keeps bandwidth under it, and a 2.5s sleep after each
+permanent envelope error keeps the error rate under 30/min.
 
 Raw format: NDJSON (gzip-streamed) for REST datasets — row shapes differ across
 datasets and carry optional footnote columns, so NDJSON avoids a brittle parquet
 schema and bounds memory to one GetData response at a time. Regional ZIPs are
 opaque bytes saved per series.
 """
+import json
 import os
 import time
 
@@ -68,7 +81,6 @@ from subsets_utils import (
     save_raw_file,
     raw_writer,
     save_state,
-    list_raw_files,
 )
 
 # --- entity union (authoritative; one spec per entry) ----------------------
@@ -90,21 +102,23 @@ ENTITY_IDS = [
 BASE_URL = "https://apps.bea.gov/api/data/"
 REGIONAL_ZIP_URL = "https://apps.bea.gov/regional/zip/{series}.zip"
 
-# Regional bulk-export series ZIPs. Verified live 2026-05-30: county/metro
-# series are split per table-number (CAINC1, CAGDP2, ...) and the bare codes
-# from the research handoff (CAINC/SAEMP/SAGDS) do NOT exist as ZIPs — they
-# return BEA's HTML landing page, which the non-ZIP guard in _fetch_regional
-# skips. This is the verified working set covering state + quarterly + county
-# GDP/income/PCE. Any code that later 404s or returns HTML is skipped, not fatal.
+# Regional bulk-export series ZIPs. Verified live: county/metro series are split
+# per table-number (CAINC1, CAGDP2, ...) and the bare codes from the research
+# handoff (CAINC/SAEMP/SAGDS) do NOT exist as ZIPs — they return BEA's HTML
+# landing page, which the non-ZIP guard in _fetch_regional skips. This is the
+# working set covering state + quarterly + county GDP/income/PCE. Any code that
+# later 404s or returns HTML is skipped, not fatal.
 REGIONAL_SERIES = [
-    "SAGDP", "SAINC", "SAPCE", "SARPP",          # state annual
-    "SQGDP", "SQINC",                            # state quarterly
+    "SAGDP", "SAINC", "SAPCE", "SARPP",                  # state annual
+    "SQGDP", "SQINC",                                    # state quarterly
     "CAGDP1", "CAGDP2", "CAGDP8", "CAGDP9", "CAGDP11",   # county GDP
     "CAINC1", "CAINC4", "CAINC5N", "CAINC5S", "CAINC6N",  # county income
     "CAINC30", "CAINC35", "CAINC45",
 ]
 
-# Per-dataset GetData driving strategy. `base` params are merged into every call.
+# Per-dataset GetData driving strategy. The all-value tokens below are the exact
+# AllValue strings BEA reports in GetParameterList for each (dataset, parameter),
+# verified live 2026-05-30.
 DATASET_STRATEGY = {
     "NIPA": {"mode": "loop_tablename", "freq": "A,Q,M", "year": "ALL"},
     "NIUnderlyingDetail": {"mode": "loop_tablename", "freq": "A,Q,M", "year": "ALL"},
@@ -121,36 +135,42 @@ DATASET_STRATEGY = {
         "freqs": ["A", "Q"],
     },
     "IntlServTrade": {
-        # API rejects ALL TypeOfService + ALL AreaOrCountry together, so pin one
-        # TypeOfService per call (117 values, ~4.9k rows each) with the rest ALL.
+        # API rejects ALL TypeOfService + ALL AreaOrCountry together and the
+        # all-services response is truncated, so pin one TypeOfService per call
+        # (the rest all-valued) for complete coverage. Tokens are the documented
+        # AllValue strings for this dataset (NOT "ALL").
         "mode": "loop_param",
         "param": "TypeOfService",
         "base": {
-            "TradeDirection": "ALL",
-            "Affiliation": "ALL",
-            "AreaOrCountry": "ALL",
+            "TradeDirection": "AllTradeDirections",
+            "Affiliation": "AllAffiliations",
+            "AreaOrCountry": "AllCountries",
             "Year": "ALL",
         },
     },
     "IntlServSTA": {
         "mode": "single",
         "base": {
-            "Channel": "ALL",
-            "Destination": "ALL",
-            "Industry": "ALL",
+            "Channel": "All",
+            "Destination": "All",
+            "Industry": "All",
             "AreaOrCountry": "AllCountries",
             "Year": "ALL",
         },
     },
     "IIP": {
-        "mode": "loop_year",
-        "base": {"TypeOfInvestment": "ALL", "Component": "ALL"},
-        "freq": "A,QSA,QNSA",
+        "mode": "single",
+        # Verified: TypeOfInvestment=All + Component=All + Year=ALL returns the
+        # full history in one call per frequency (no per-year loop needed).
+        "base": {"TypeOfInvestment": "All", "Component": "All", "Year": "ALL"},
+        "freqs": ["A", "QNSA", "QSA"],
     },
     "ITA": {
         "mode": "loop_area",
-        "base": {"Indicator": "ALL"},
-        "freq": "A,QSA,QNSA",
+        # API forbids ALL Indicator + ALL AreaOrCountry together; AreaOrCountry
+        # has the fewer values, so loop it and keep Indicator all-valued.
+        "base": {"Indicator": "All"},
+        "freq": "A,QNSA,QSA",
     },
     "MNE": {"mode": "mne"},
     "Regional": {"mode": "regional_zip"},
@@ -159,9 +179,18 @@ DATASET_STRATEGY = {
 # spec id -> original dataset name (entity ids have no underscores).
 ID_TO_DATASET = {f"bea-{e.lower()}": e for e in ENTITY_IDS}
 
-# After an MNE envelope error, sleep this long so the error rate stays under
-# BEA's documented 30-errors/minute throttle (60/30 = 2.0s floor; 2.5s for slack).
-_MNE_ERROR_SLEEP = 2.5
+# Sleep after each PERMANENT envelope error so the error rate stays under BEA's
+# documented 30-errors/minute throttle (60/30 = 2.0s floor; 2.5s for slack).
+_ERROR_SLEEP = 2.5
+
+# BEA envelope error codes that are TRANSIENT (cold/large result still being
+# generated). Retried by the backoff loop rather than skipped.
+_RETRYABLE_API_CODES = {"204"}
+_RETRYABLE_DESC_HINTS = ("being generated", "try again", "please try", "retrieving")
+
+# Rolling byte budget: 80% of BEA's documented 100MB/min, per UserID.
+_BYTE_BUDGET = int(0.8 * 100 * 1024 * 1024)
+_byte_window: list = []  # list[(timestamp, nbytes)] within the trailing 60s
 
 
 # --- transport -------------------------------------------------------------
@@ -176,7 +205,13 @@ _TRANSIENT_EXC = (
 )
 
 
+class _BeaRetry(Exception):
+    """Raised on a retryable BEA envelope error so tenacity retries the call."""
+
+
 def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, _BeaRetry):
+        return True
     if isinstance(exc, _TRANSIENT_EXC):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -185,8 +220,40 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _throttle_bytes(nbytes: int) -> None:
+    """Keep a trailing-60s byte total under BEA's documented 100MB/min."""
+    now = time.time()
+    cutoff = now - 60.0
+    while _byte_window and _byte_window[0][0] < cutoff:
+        _byte_window.pop(0)
+    if _byte_window and sum(b for _, b in _byte_window) + nbytes > _BYTE_BUDGET:
+        time.sleep(max(0.0, 60.0 - (now - _byte_window[0][0])))
+        now2 = time.time()
+        cutoff2 = now2 - 60.0
+        while _byte_window and _byte_window[0][0] < cutoff2:
+            _byte_window.pop(0)
+    _byte_window.append((time.time(), nbytes))
+
+
+def _envelope_error(js: dict):
+    """Return the BEA error dict (or None). Error may live at BEAAPI.Error or
+    BEAAPI.Results.Error, and either may itself be a single-element list."""
+    top = js.get("BEAAPI", js) if isinstance(js, dict) else {}
+    res = top.get("Results")
+    if isinstance(res, list):
+        res = res[0] if res else {}
+    err = None
+    if isinstance(res, dict) and res.get("Error"):
+        err = res["Error"]
+    elif top.get("Error"):
+        err = top["Error"]
+    if isinstance(err, list):
+        err = err[0] if err else None
+    return err if isinstance(err, dict) else None
+
+
 @sleep_and_retry
-@limits(calls=80, period=60)  # ~80% of documented 100/min, per UserID (global)
+@limits(calls=80, period=60)  # ~80% of documented 100 req/min, per UserID (global)
 @retry(
     retry=retry_if_exception(_is_transient),
     stop=stop_after_attempt(6),
@@ -194,12 +261,22 @@ def _is_transient(exc: BaseException) -> bool:
     reraise=True,
 )
 def _api(params: dict) -> dict:
-    """One BEA REST call. Returns the parsed JSON envelope."""
+    """One BEA REST call. Returns the parsed JSON envelope. Raises `_BeaRetry`
+    on a transient envelope error so the backoff loop retries; permanent
+    envelope errors are returned for the caller to handle."""
     key = os.environ["BEA_API_KEY"]
     full = {"UserID": key, "ResultFormat": "JSON", **params}
-    resp = get(BASE_URL, params=full, timeout=(10.0, 180.0))
+    resp = get(BASE_URL, params=full, timeout=(10.0, 240.0))
     resp.raise_for_status()
-    return resp.json()
+    _throttle_bytes(len(resp.content))
+    js = resp.json()
+    err = _envelope_error(js)
+    if err is not None:
+        code = str(err.get("APIErrorCode"))
+        desc = str(err.get("APIErrorDescription") or "")
+        if code in _RETRYABLE_API_CODES or any(h in desc.lower() for h in _RETRYABLE_DESC_HINTS):
+            raise _BeaRetry(f"BEA {code}: {desc[:140]}")
+    return js
 
 
 @sleep_and_retry
@@ -213,22 +290,19 @@ def _api(params: dict) -> dict:
 def _api_bytes(url: str) -> bytes:
     resp = get(url, timeout=(10.0, 300.0))
     resp.raise_for_status()
+    _throttle_bytes(len(resp.content))
     return resp.content
 
 
 def _results_data(js: dict):
-    """Pull (Data rows, Error) out of the BEAAPI envelope.
-
-    Results may be a dict or a single-element list, and an error can surface
-    either at BEAAPI.Error or BEAAPI.Results.Error — check both.
-    """
+    """Pull (Data rows, permanent-error) out of the BEAAPI envelope. Transient
+    errors are already retried/raised inside `_api`, so any error here is
+    permanent for this call."""
     top = js.get("BEAAPI", js)
-    err = top.get("Error")
     res = top.get("Results")
     if isinstance(res, list):
         res = res[0] if res else {}
-    if isinstance(res, dict) and res.get("Error"):
-        err = res["Error"]
+    err = _envelope_error(js)
     data = res.get("Data", []) if isinstance(res, dict) else []
     return data, err
 
@@ -288,11 +362,6 @@ def _plan_calls(dataset: str, strat: dict) -> list[dict]:
             {**strat["base"], param: code}
             for code in _param_codes(dataset, param)
         ]
-    if mode == "loop_year":
-        return [
-            {**strat["base"], "Frequency": strat["freq"], "Year": y}
-            for y in _param_codes(dataset, "Year")
-        ]
     if mode == "loop_area":
         areas = [a for a in _param_codes(dataset, "AreaOrCountry") if a != "AllCountries"]
         return [
@@ -303,8 +372,6 @@ def _plan_calls(dataset: str, strat: dict) -> list[dict]:
 
 
 def _write_rows(fh, rows) -> int:
-    import json
-
     n = 0
     for row in rows:
         fh.write(json.dumps(row, ensure_ascii=False))
@@ -330,6 +397,7 @@ def _fetch_planned(asset: str, dataset: str, strat: dict) -> int:
                     f"{err.get('APIErrorDescription') or err}",
                     flush=True,
                 )
+                time.sleep(_ERROR_SLEEP)  # keep permanent-error rate < 30/min
                 continue
             total += _write_rows(fh, data)
             if i % 25 == 0 or i == len(calls):
@@ -345,44 +413,61 @@ def _fetch_planned(asset: str, dataset: str, strat: dict) -> int:
 
 
 def _fetch_mne(asset: str) -> int:
-    """MNE: DirectionOfInvestment x Classification, Year=all.
+    """MNE: one GetData per (DirectionOfInvestment, Classification), Year=all.
 
-    The Classification value (e.g. 'CountryByIndustry') is itself the breakdown
-    selector — no extra ALL-valued breakout param is needed (verified live).
-    Not every (direction, classification) pair is valid; invalid pairs return an
-    envelope error and are skipped, with an error-paced sleep so the spec stays
-    under BEA's 30-errors/minute throttle.
+    MNE GetData requires SeriesID/OwnershipLevel/NonbankAffiliatesOnly (omitting
+    them returns APIErrorCode 40 — the prior failure). With SeriesID=0/
+    OwnershipLevel=0/NonbankAffiliatesOnly=0, a single Year="all" call per pair
+    returns the full history and stays small (verified ~31k rows/12MB for the
+    largest pair), so no per-year loop is needed. Invalid (direction,
+    classification) combos return a permanent envelope error and are skipped
+    (error-paced under BEA's 30-errors/minute cap).
     """
     dataset = "MNE"
+    base = {"SeriesID": "0", "OwnershipLevel": "0", "NonbankAffiliatesOnly": "0"}
     directions = _param_codes(dataset, "DirectionOfInvestment")
     classifications = _param_codes(dataset, "Classification")
     total = 0
-    combos = 0
     errors = 0
+    pairs_ok = 0
     with raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip") as fh:
         for direction in directions:
             for classification in classifications:
-                combos += 1
-                js = _api({
+                # Year="all" returns the full history in one call (verified
+                # ~31k rows/12MB for the largest pair). The Year parameter list
+                # itself contains "all" PLUS every individual year, so iterating
+                # it would re-fetch the whole history and duplicate every row —
+                # one Year="all" call per pair is both complete and correct.
+                data, err = _results_data(_api({
                     "method": "GetData",
                     "datasetname": dataset,
                     "DirectionOfInvestment": direction,
                     "Classification": classification,
                     "Year": "all",
-                })
-                data, err = _results_data(js)
+                    **base,
+                }))
                 if err:
                     errors += 1
-                    time.sleep(_MNE_ERROR_SLEEP)  # keep under 30 errors/minute
-                    continue
-                total += _write_rows(fh, data)
-                if combos % 10 == 0:
+                    time.sleep(_ERROR_SLEEP)
                     print(
-                        f"  [MNE] {combos} combos, {total} rows, {errors} skipped",
+                        f"  [MNE] {direction}/{classification}: invalid combo "
+                        f"({err.get('APIErrorCode')}), skipped",
                         flush=True,
                     )
+                    continue
+                pair_rows = _write_rows(fh, data)
+                pairs_ok += 1
+                total += pair_rows
+                print(
+                    f"  [MNE] {direction}/{classification}: {pair_rows} rows "
+                    f"(running total {total}, {pairs_ok} valid pairs)",
+                    flush=True,
+                )
     if total == 0:
-        raise RuntimeError("MNE: 0 rows across all direction/classification combos")
+        raise RuntimeError(
+            f"MNE: 0 rows across {len(directions)}x{len(classifications)} combos "
+            f"({errors} errors)"
+        )
     return total
 
 
