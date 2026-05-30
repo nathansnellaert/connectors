@@ -2,33 +2,43 @@
 
 Mechanism: valet_rest (https://www.bankofcanada.ca/valet/). No auth, no key.
 
-Two collect entities → two download specs:
+Two collect entities -> two download specs:
 
   * ``series`` — the full series catalog from ``/lists/series/json``
-    (one row per series: series_id, label, description, link). Small, stable,
-    tabular → single parquet asset.
+    (one row per series: series_id, label, description, link). ~15.6k rows,
+    stable, tabular -> single parquet asset.
 
   * ``values`` — the long-format observation firehose across *all* ~15.6k
     series. Far too large for one file, so this is a batched firehose
-    (shape 3): the series universe is sorted and walked in chunks, each chunk
-    fetched in one comma-separated multi-series observation call and written as
-    its own NDJSON batch asset ``bank-of-canada-values-{chunk_index}``.
+    (shape 3): the series universe is sorted and walked in chunks of
+    ``CHUNK_SIZE``, each chunk fetched in one comma-separated multi-series
+    ``/observations`` call and written as its own NDJSON batch asset
+    ``bank-of-canada-values-NNNN``.
 
     NDJSON (not parquet) is deliberate: the observation payload is
     heterogeneous. Most series carry a date dimension (``{"d": "...",
-    "<sid>": {"v": "..."}}``) but some (e.g. ``AUC_BOND_*``) carry a
-    non-date dimension keyed by ``bond_id`` etc. The dimension key is named by
+    "<sid>": {"v": "..."}}``) but some carry a non-date dimension keyed by
+    ``bond_id`` etc. The dimension key is named by
     ``seriesDetail[sid].dimension.key`` and varies across series, so rows are
     parsed generically into ``{series_id, dim_key, dim_value, value}`` and the
     string-typed value is left for transform to coerce.
 
-Refresh strategy for ``values``: full re-pull every run (overwriting each
-batch). BoC series are revised, so trusting a per-series date watermark would
-silently drop corrections; a full pass over the corpus is cheap (~300 chunked
-calls, a few minutes). State is used only for *in-run crash resume* (which
-chunk to continue from), never as a terminal flag — a completed pass resets to
-chunk 0 on the next invocation. ``start_date`` incremental query is supported
-by the API but intentionally unused for the reason above.
+Refresh strategy for ``values``: full re-pull every run. BoC series are
+revised, so a per-series date watermark would silently drop corrections; a
+full pass over the corpus is cheap (~157 chunked calls, ~2-3 min). State is
+used only for *in-run crash resume* and *wall-clock pacing* — a completed pass
+resets to chunk 0 on the next invocation; it is never a terminal flag.
+
+Pacing: each invocation stops cleanly after ``MAX_FETCH_SECONDS`` with state
+advanced, so the fetch can never be hard-killed mid-pass by a materialize
+timeout (the failure mode of the prior attempt, which crawled 313 chunks with
+no wall-clock guard and was orphaned). The full corpus normally completes well
+inside the budget; if it ever doesn't, the next refresh resumes where this one
+stopped.
+
+Robustness: a single invalid id 404s an entire multi-series call, so a
+permanent 4xx on a chunk falls back to fetching that chunk's series one at a
+time, skipping only the genuinely-bad ids rather than losing the whole chunk.
 
 Freshness gating (whether a spec runs at all) is the maintain step's job.
 """
@@ -61,21 +71,26 @@ from subsets_utils import (
 BASE_URL = "https://www.bankofcanada.ca/valet"
 
 # Bump when the `values` resume-state contract changes (keys / cursor shape).
-STATE_VERSION = 1
+STATE_VERSION = 2
 
-# Series per multi-series observation call. 50 keeps URLs ~1KB and per-chunk
-# responses a few MB; ~313 chunks for the current ~15.6k-series corpus.
-CHUNK_SIZE = 50
+# Series per multi-series observation call. 100 keeps the corpus to ~157 calls
+# (fast) while bounding the heaviest response to ~9MB / ~55MB peak RSS (probed).
+CHUNK_SIZE = 100
+
+# Soft wall-clock budget per invocation. The full corpus is ~2-3 min; this
+# leaves generous headroom and guarantees a clean self-stop (state advanced)
+# before any plausible materialize hard-kill. Hitting it is deliberate pacing,
+# NOT an error — the next refresh resumes from the saved watermark.
+MAX_FETCH_SECONDS = 300.0
 
 # A partial pass older than this is meaningless to resume (the corpus moves on);
 # treat stale in-flight state as empty and start a fresh full pass.
 STALE_RESUME_SECONDS = 2 * 86400
 
-# Skipped-chunk markers (permanent 4xx on a chunk) expire so source recovery is
-# automatic.
+# Skipped-series markers (permanent 4xx) expire so source recovery is automatic.
 SKIP_TTL_SECONDS = 14 * 86400
 
-# Safety ceiling: if the series listing balloons far past observed scale,
+# Safety ceiling: if the series listing balloons far past observed scale (~15.6k),
 # surface it loudly rather than silently churning through tens of thousands of
 # extra calls.
 MAX_SERIES = 60_000
@@ -108,11 +123,12 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 @sleep_and_retry
-@limits(calls=4, period=1)  # polite ~4 rps; docs advise a gradual request rate
+@limits(calls=5, period=1)  # polite ~5 rps; docs advise a gradual request rate
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(6),
-    wait=wait_exponential(min=4, max=120),
+    stop=stop_after_attempt(5),
+    # Tight cap: one flaky chunk can't eat the whole wall-clock budget.
+    wait=wait_exponential(min=2, max=30),
     reraise=True,
 )
 def _get_json(url: str, params: dict | None = None) -> dict:
@@ -125,8 +141,8 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _fetch_series_index() -> list[str]:
-    """Return the sorted list of all series ids exposed by the Valet API."""
+def _list_series() -> dict:
+    """Return the raw ``series`` mapping from /lists/series/json."""
     payload = _get_json(f"{BASE_URL}/lists/series/json")
     series = payload.get("series", {})
     if not series:
@@ -136,7 +152,7 @@ def _fetch_series_index() -> list[str]:
             f"series count {len(series)} exceeds safety ceiling {MAX_SERIES}; "
             "investigate before crawling"
         )
-    return sorted(series.keys())
+    return series
 
 
 # --------------------------------------------------------------------------- #
@@ -145,11 +161,7 @@ def _fetch_series_index() -> list[str]:
 
 def fetch_series(node_id: str) -> None:
     asset = node_id  # the spec id IS the asset name
-    payload = _get_json(f"{BASE_URL}/lists/series/json")
-    series = payload.get("series", {})
-    if not series:
-        raise AssertionError("lists/series returned no series — unexpected")
-
+    series = _list_series()
     rows = [
         {
             "series_id": sid,
@@ -199,6 +211,54 @@ def _parse_observations(payload: dict) -> list[dict]:
     return out
 
 
+def _is_permanent_4xx(exc: httpx.HTTPStatusError) -> bool:
+    code = exc.response.status_code
+    return code != 429 and 400 <= code < 500
+
+
+def _fetch_chunk_rows(chunk: list[str], asset: str, skipped: dict) -> list[dict]:
+    """Fetch one chunk of series, returning flattened long-format rows.
+
+    Fast path: a single multi-series call. A single invalid id 404s the whole
+    call, so on a permanent 4xx we fall back to per-series calls and skip only
+    the genuinely-bad ids (recording a TTL-bound marker) — never losing the
+    whole chunk to one bad member.
+    """
+    url = f"{BASE_URL}/observations/{','.join(chunk)}/json"
+    try:
+        return _parse_observations(_get_json(url))
+    except httpx.HTTPStatusError as exc:
+        if not _is_permanent_4xx(exc):
+            raise
+        code = exc.response.status_code
+        print(
+            f"[{asset}] bulk call {code}; falling back to per-series for "
+            f"{len(chunk)} ids (url={url})",
+            flush=True,
+        )
+
+    rows: list[dict] = []
+    for sid in chunk:
+        try:
+            rows.extend(
+                _parse_observations(_get_json(f"{BASE_URL}/observations/{sid}/json"))
+            )
+        except httpx.HTTPStatusError as exc:
+            if _is_permanent_4xx(exc):
+                print(
+                    f"[{asset}] permanent {exc.response.status_code} for series "
+                    f"{sid}; skipping",
+                    flush=True,
+                )
+                skipped[sid] = {
+                    "reason": f"http_{exc.response.status_code}",
+                    "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
+                }
+                continue
+            raise
+    return rows
+
+
 def _purge_expired_skips(skipped: dict) -> dict:
     now = int(time.time())
     return {
@@ -208,11 +268,24 @@ def _purge_expired_skips(skipped: dict) -> dict:
     }
 
 
+def _save_progress(state_key, series_count, total_chunks, completed, skipped):
+    save_state(state_key, {
+        "schema_version": STATE_VERSION,
+        "series_count": series_count,
+        "total_chunks": total_chunks,
+        "completed_chunks": completed,
+        "last_success_at": _now_iso(),
+        "skipped": skipped,
+    })
+
+
 def fetch_values(node_id: str) -> None:
     state_key = node_id  # "bank-of-canada-values"
+    started = time.monotonic()
 
-    series_ids = _fetch_series_index()
-    total_chunks = math.ceil(len(series_ids) / CHUNK_SIZE)
+    series_ids = sorted(_list_series().keys())
+    series_count = len(series_ids)
+    total_chunks = math.ceil(series_count / CHUNK_SIZE)
 
     state = load_state(state_key)
     if state.get("schema_version") != STATE_VERSION:
@@ -240,85 +313,63 @@ def fetch_values(node_id: str) -> None:
     # Resume an in-flight pass only if it matches the current corpus, isn't
     # already complete, and is recent. Otherwise start a fresh full re-pull.
     fresh = (
-        state.get("series_count") != len(series_ids)
+        state.get("series_count") != series_count
         or done >= total_chunks
         or stale
     )
     start = 0 if fresh else done
-    skipped = _purge_expired_skips(state.get("skipped", {}) if not fresh else {})
+    skipped = _purge_expired_skips({} if fresh else state.get("skipped", {}))
 
     print(
-        f"[{state_key}] {len(series_ids)} series, {total_chunks} chunks; "
-        f"{'fresh pass' if fresh else f'resuming at chunk {start}'}",
+        f"[{state_key}] {series_count} series, {total_chunks} chunks "
+        f"(size {CHUNK_SIZE}); {'fresh pass' if fresh else f'resuming at chunk {start}'}",
         flush=True,
     )
 
     total_rows = 0
+    last_done = start
     for ci in range(start, total_chunks):
-        batch_key = f"{ci:04d}"
-        asset = f"{state_key}-{batch_key}"
-        chunk = series_ids[ci * CHUNK_SIZE : (ci + 1) * CHUNK_SIZE]
-        url = f"{BASE_URL}/observations/{','.join(chunk)}/json"
-        try:
-            payload = _get_json(url)
-        except httpx.HTTPStatusError as exc:
-            code = exc.response.status_code
-            # Transient (429/5xx) is retried by the decorator; reaching here on
-            # a 4xx means a permanent failure for this chunk.
-            if code != 429 and 400 <= code < 500:
-                print(
-                    f"[{asset}] permanent {code} for chunk {ci} "
-                    f"(url={url}); skipping",
-                    flush=True,
-                )
-                skipped[batch_key] = {
-                    "reason": f"http_{code}",
-                    "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
-                }
-                # raw-before-state holds: no raw written, advance progress only.
-                save_state(state_key, {
-                    "schema_version": STATE_VERSION,
-                    "series_count": len(series_ids),
-                    "total_chunks": total_chunks,
-                    "completed_chunks": ci + 1,
-                    "last_success_at": _now_iso(),
-                    "skipped": skipped,
-                })
-                continue
-            raise
+        elapsed = time.monotonic() - started
+        if elapsed > MAX_FETCH_SECONDS:
+            print(
+                f"[{state_key}] wall-clock budget reached at chunk {ci}/"
+                f"{total_chunks} ({elapsed:.0f}s); stopping cleanly, will resume",
+                flush=True,
+            )
+            break
 
-        rows = _parse_observations(payload)
+        asset = f"{state_key}-{ci:04d}"
+        chunk = series_ids[ci * CHUNK_SIZE : (ci + 1) * CHUNK_SIZE]
+        rows = _fetch_chunk_rows(chunk, asset, skipped)
+
         # Write raw FIRST, then advance state.
         save_raw_ndjson(rows, asset)
         total_rows += len(rows)
-        save_state(state_key, {
-            "schema_version": STATE_VERSION,
-            "series_count": len(series_ids),
-            "total_chunks": total_chunks,
-            "completed_chunks": ci + 1,
-            "last_success_at": _now_iso(),
-            "skipped": skipped,
-        })
+        last_done = ci + 1
+        _save_progress(state_key, series_count, total_chunks, last_done, skipped)
 
-        if (ci + 1) % 25 == 0 or ci + 1 == total_chunks:
+        if last_done % 25 == 0 or last_done == total_chunks:
             print(
-                f"[{state_key}] chunk {ci + 1}/{total_chunks} "
-                f"(+{len(rows)} rows, {total_rows} this run)",
+                f"[{state_key}] chunk {last_done}/{total_chunks} "
+                f"(+{len(rows)} rows, {total_rows} this run, {elapsed:.0f}s)",
                 flush=True,
             )
 
     # Stamp run stats for cross-run drift diagnostics.
     final = load_state(state_key)
     final["last_run_stats"] = {
-        "chunks_fetched": total_chunks - start,
+        "chunks_done_this_run": last_done - start,
+        "completed_chunks": last_done,
+        "total_chunks": total_chunks,
         "rows_this_run": total_rows,
-        "series_count": len(series_ids),
-        "skipped_chunks": len(skipped),
+        "series_count": series_count,
+        "skipped_series": len(skipped),
+        "seconds": round(time.monotonic() - started, 1),
     }
     save_state(state_key, final)
     print(
-        f"[{state_key}] pass complete: {total_rows} rows across "
-        f"{total_chunks - start} chunks ({len(skipped)} skipped)",
+        f"[{state_key}] run done: {total_rows} rows across {last_done - start} "
+        f"chunks ({last_done}/{total_chunks} complete, {len(skipped)} skipped)",
         flush=True,
     )
 

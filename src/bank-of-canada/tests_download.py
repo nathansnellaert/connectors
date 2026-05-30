@@ -3,13 +3,17 @@
 Catches silent degradation that file-existence alone misses: empty catalog,
 truncated firehose, or an observation payload whose shape drifted away from the
 generic {series_id, dim_key, dim_value, value} contract.
+
+The `values` firehose self-stops on a wall-clock budget and resumes across
+runs, so thresholds are set to catch *total* failure (zero/near-zero batches)
+while tolerating a partial pass — not to assert the full ~157-batch corpus.
 """
 
 from subsets_utils import load_raw_parquet, load_raw_ndjson, list_raw_files
 
 
 def test_series_catalog_populated():
-    """The series catalog should list a large, stable corpus (~15k+ series)."""
+    """The series catalog should list a large, stable corpus (~15.6k series)."""
     table = load_raw_parquet("bank-of-canada-series")
     assert len(table) > 10_000, (
         f"series catalog has only {len(table)} rows; expected >10k"
@@ -37,8 +41,9 @@ def _value_batch_assets() -> list[str]:
 def test_values_firehose_populated():
     """The observation firehose should produce many batches with real rows."""
     assets = _value_batch_assets()
-    assert len(assets) > 50, (
-        f"only {len(assets)} value batch files; expected hundreds"
+    assert len(assets) > 20, (
+        f"only {len(assets)} value batch files; expected dozens "
+        "(full corpus is ~157 batches)"
     )
 
     total = 0
