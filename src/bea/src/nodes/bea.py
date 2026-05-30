@@ -26,10 +26,17 @@ hardcoded year range):
   - loop_area     : one GetData per AreaOrCountry (except AllCountries),
                     Indicator=ALL (ITA — API forbids ALL Indicator + ALL
                     AreaOrCountry together; AreaOrCountry has fewer values).
-  - mne           : DirectionOfInvestment x Classification, Year=all, with a
-                    single breakout dimension set to "all" (MNE caps ALL-valued
-                    params at 3; invalid combos return an envelope error and are
-                    skipped).
+  - loop_param    : one GetData per value of a single enumerated parameter,
+                    everything else ALL (IntlServTrade — the API forbids ALL
+                    TypeOfService + ALL AreaOrCountry together, so we pin
+                    exactly one TypeOfService per call; verified live 2026-05-30).
+  - mne           : DirectionOfInvestment x Classification, Year=all (verified
+                    live 2026-05-30: the Classification value IS the breakdown
+                    selector, so no extra breakout param is needed — e.g.
+                    inward/CountryByIndustry returns ~220k rows on its own).
+                    Invalid (direction, classification) combos return an
+                    envelope error and are skipped; an error-paced sleep keeps
+                    the spec under BEA's documented 30-errors/minute throttle.
   - regional_zip  : per-series ZIP bulk export.
 
 Rate limit: BEA documents 100 requests/min PER UserID (global across processes,
@@ -114,12 +121,14 @@ DATASET_STRATEGY = {
         "freqs": ["A", "Q"],
     },
     "IntlServTrade": {
-        "mode": "single",
+        # API rejects ALL TypeOfService + ALL AreaOrCountry together, so pin one
+        # TypeOfService per call (117 values, ~4.9k rows each) with the rest ALL.
+        "mode": "loop_param",
+        "param": "TypeOfService",
         "base": {
-            "TypeOfService": "ALL",
             "TradeDirection": "ALL",
             "Affiliation": "ALL",
-            "AreaOrCountry": "AllCountries",
+            "AreaOrCountry": "ALL",
             "Year": "ALL",
         },
     },
@@ -150,9 +159,9 @@ DATASET_STRATEGY = {
 # spec id -> original dataset name (entity ids have no underscores).
 ID_TO_DATASET = {f"bea-{e.lower()}": e for e in ENTITY_IDS}
 
-# MNE breakout dimensions tried in order; first that yields data wins. MNE caps
-# ALL-valued params at 3, so exactly one breakout is set to "all" per call.
-_MNE_BREAKOUTS = [{"Country": "all"}, {"Industry": "all"}, {"State": "all"}, {}]
+# After an MNE envelope error, sleep this long so the error rate stays under
+# BEA's documented 30-errors/minute throttle (60/30 = 2.0s floor; 2.5s for slack).
+_MNE_ERROR_SLEEP = 2.5
 
 
 # --- transport -------------------------------------------------------------
@@ -273,6 +282,12 @@ def _plan_calls(dataset: str, strat: dict) -> list[dict]:
             {"TableID": code, "Year": strat["year"]}
             for code in _param_codes(dataset, "TableID")
         ]
+    if mode == "loop_param":
+        param = strat["param"]
+        return [
+            {**strat["base"], param: code}
+            for code in _param_codes(dataset, param)
+        ]
     if mode == "loop_year":
         return [
             {**strat["base"], "Frequency": strat["freq"], "Year": y}
@@ -330,41 +345,42 @@ def _fetch_planned(asset: str, dataset: str, strat: dict) -> int:
 
 
 def _fetch_mne(asset: str) -> int:
-    """MNE: DirectionOfInvestment x Classification, Year=all, one breakout=all."""
+    """MNE: DirectionOfInvestment x Classification, Year=all.
+
+    The Classification value (e.g. 'CountryByIndustry') is itself the breakdown
+    selector — no extra ALL-valued breakout param is needed (verified live).
+    Not every (direction, classification) pair is valid; invalid pairs return an
+    envelope error and are skipped, with an error-paced sleep so the spec stays
+    under BEA's 30-errors/minute throttle.
+    """
     dataset = "MNE"
     directions = _param_codes(dataset, "DirectionOfInvestment")
     classifications = _param_codes(dataset, "Classification")
     total = 0
     combos = 0
+    errors = 0
     with raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip") as fh:
         for direction in directions:
             for classification in classifications:
                 combos += 1
-                got = False
-                for breakout in _MNE_BREAKOUTS:
-                    params = {
-                        "method": "GetData",
-                        "datasetname": dataset,
-                        "DirectionOfInvestment": direction,
-                        "Classification": classification,
-                        "Year": "all",
-                        **breakout,
-                    }
-                    js = _api(params)
-                    data, err = _results_data(js)
-                    if err or not data:
-                        continue
-                    total += _write_rows(fh, data)
-                    got = True
-                    break
-                if not got:
+                js = _api({
+                    "method": "GetData",
+                    "datasetname": dataset,
+                    "DirectionOfInvestment": direction,
+                    "Classification": classification,
+                    "Year": "all",
+                })
+                data, err = _results_data(js)
+                if err:
+                    errors += 1
+                    time.sleep(_MNE_ERROR_SLEEP)  # keep under 30 errors/minute
+                    continue
+                total += _write_rows(fh, data)
+                if combos % 10 == 0:
                     print(
-                        f"  [MNE] no data for {direction}/{classification} "
-                        f"(all breakouts invalid) - skipping",
+                        f"  [MNE] {combos} combos, {total} rows, {errors} skipped",
                         flush=True,
                     )
-                if combos % 10 == 0:
-                    print(f"  [MNE] {combos} combos, {total} rows so far", flush=True)
     if total == 0:
         raise RuntimeError("MNE: 0 rows across all direction/classification combos")
     return total
