@@ -2,9 +2,18 @@
 
 Run post-DAG by the connector. Catches silent degradation that file existence
 alone misses — empty payloads, the ES envelope leaking through, truncated crawls.
+
+MEMORY: raw assets here are huge (sod ~2.82M rows, financials ~1.68M,
+demographics ~1.67M, each row carrying hundreds of fields). The prior attempt
+called ``load_raw_ndjson`` — which materializes the WHOLE file as a list[dict] —
+once per test per asset, spiking RSS to ~7.2GB and OOM-killing the runner. These
+tests instead STREAM each asset exactly once via ``raw_reader``, parsing only the
+first line and counting the rest, so peak memory is a single JSON record.
 """
 
-from subsets_utils import load_raw_ndjson
+import json
+
+from subsets_utils import raw_reader
 
 # Floor row counts, set well below the live totals observed during probing
 # (institutions ~27.8k, failures ~4.1k, summary ~8.1k, history ~583k,
@@ -22,37 +31,52 @@ _MIN_ROWS = {
 }
 
 
-def test_all_raw_assets_nonempty(spec_ids):
-    """Every spec's raw NDJSON should hold records."""
-    for sid in spec_ids:
-        rows = load_raw_ndjson(sid)
-        assert len(rows) > 0, f"{sid}: raw NDJSON has 0 records"
+def _scan(sid):
+    """Stream one raw NDJSON asset once. Returns (row_count, first_record).
+
+    Memory-bounded: only the first record is retained; everything else is just
+    counted line-by-line. Mirrors how the download node WROTE the asset
+    (raw_writer(..., "ndjson.gz", mode="wt", compression="gzip")).
+    """
+    count = 0
+    first = None
+    with raw_reader(sid, "ndjson.gz", mode="rt", compression="gzip") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if first is None:
+                first = json.loads(line)
+            count += 1
+    return count, first
 
 
-def test_row_counts_meet_floor(spec_ids):
-    """Each endpoint should return at least its expected floor of rows."""
-    for sid in spec_ids:
-        floor = _MIN_ROWS.get(sid)
-        if floor is None:
-            continue
-        rows = load_raw_ndjson(sid)
-        assert len(rows) >= floor, (
-            f"{sid}: got {len(rows):,} records, expected >= {floor:,} — "
-            f"likely a truncated crawl or upstream change"
-        )
+def test_raw_assets_healthy(spec_ids):
+    """Single streaming pass per asset enforces all download invariants:
 
-
-def test_records_are_unwrapped(spec_ids):
-    """Records must be the real FDIC row, not the ES {data, score} wrapper.
-
-    If unwrapping regressed, every row would be exactly {'data': {...}, 'score': N}.
+    1. non-empty — empty payloads usually mean the endpoint changed format/auth.
+    2. row-count floor — far fewer rows than expected => truncated crawl.
+    3. records are the real FDIC row, not the ES {data, score} wrapper, and
+       carry the universal 'ID' field.
     """
     for sid in spec_ids:
-        rows = load_raw_ndjson(sid)
-        sample = rows[0]
-        assert isinstance(sample, dict), f"{sid}: record is not a dict"
-        assert set(sample.keys()) != {"data", "score"}, (
+        count, first = _scan(sid)
+
+        # (1) non-empty
+        assert count > 0, f"{sid}: raw NDJSON has 0 records"
+
+        # (2) floor
+        floor = _MIN_ROWS.get(sid)
+        if floor is not None:
+            assert count >= floor, (
+                f"{sid}: got {count:,} records, expected >= {floor:,} — "
+                f"likely a truncated crawl or upstream change"
+            )
+
+        # (3) unwrapped real record with ID
+        assert isinstance(first, dict), f"{sid}: first record is not a dict"
+        assert set(first.keys()) != {"data", "score"}, (
             f"{sid}: ES envelope leaked into raw — records not unwrapped"
         )
-        # Every FDIC endpoint row carries an 'ID' field.
-        assert "ID" in sample, f"{sid}: expected 'ID' field, got keys {list(sample)[:10]}"
+        assert "ID" in first, (
+            f"{sid}: expected 'ID' field, got keys {list(first)[:10]}"
+        )
