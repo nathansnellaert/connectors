@@ -159,16 +159,61 @@ def _extract_records(payload, preferred_keys: tuple[str, ...]) -> list[dict]:
     return []
 
 
+def _envelope_count(payload) -> int | None:
+    """Total record count if the envelope echoes it (v1 returns 'count').
+
+    Used as the authoritative pagination terminator when present; falls back to
+    short-page detection otherwise. v2's envelope is unverified, so this is
+    best-effort: a non-int or absent 'count' just disables the optimisation.
+    """
+    if isinstance(payload, dict):
+        c = payload.get("count")
+        if isinstance(c, int):
+            return c
+    return None
+
+
+def _page_signature(records: list[dict]) -> tuple:
+    """Cheap fingerprint of a page used to detect an API that ignores offset
+    (returns the same page repeatedly). Avoids holding whole pages in memory."""
+    if not records:
+        return (0,)
+    first, last = records[0], records[-1]
+    return (len(records), repr(first)[:200], repr(last)[:200])
+
+
 def _paginate(path: str, base_params: dict, preferred_keys: tuple[str, ...], page_limit: int):
-    """Yield records across offset-paginated pages until a short/empty page."""
+    """Yield records across offset-paginated pages.
+
+    Termination, in priority order:
+      1. envelope 'count' reached (authoritative when the API echoes it),
+      2. a short/empty page (fewer than page_limit records),
+      3. _MAX_PAGES safety cap (raises — signals runaway / ignored paging).
+    Also fails fast if two consecutive full pages are identical, which means the
+    server is ignoring offset and we'd otherwise duplicate to the cap.
+    """
     offset = 0
     pages = 0
+    yielded = 0
+    prev_sig = None
     while True:
         payload = _get_json(path, **base_params, limit=page_limit, offset=offset)
         records = _extract_records(payload, preferred_keys)
+        sig = _page_signature(records)
+        if records and sig == prev_sig:
+            raise RuntimeError(
+                f"{path} (params={base_params}) returned an identical page at "
+                f"offset {offset} — the server is ignoring limit/offset paging."
+            )
+        prev_sig = sig
         for rec in records:
             yield rec
+        yielded += len(records)
         pages += 1
+
+        total = _envelope_count(payload)
+        if total is not None and yielded >= total:
+            return
         if len(records) < page_limit:
             return
         if pages >= _MAX_PAGES:
