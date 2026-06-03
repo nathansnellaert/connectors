@@ -34,14 +34,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import (
-    is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name,
-    get_r2_prefix, get_r2_base,
+    is_cloud, get_connector_name, get_data_dir, get_bucket_name,
+    get_r2_prefix, get_r2_run_base,
 )
-from . import debug
+from .storage import backend
+from . import platform_github
 
 
 # =============================================================================
-# R2 I/O via fsspec — single backend for all cloud operations
+# R2 I/O — thin bucket-key wrappers over the shared StorageBackend
 # =============================================================================
 
 def _r2_uri(key: str) -> str:
@@ -49,27 +50,12 @@ def _r2_uri(key: str) -> str:
     return f"s3://{get_bucket_name()}/{key}"
 
 
-def _r2_upload_bytes(data: bytes, key: str) -> None:
-    uri = _r2_uri(key)
-    fs = get_fs(uri)
-    with fs.open(uri, "wb") as f:
-        f.write(data)
-
-
 def _r2_upload_file(path: str, key: str) -> None:
-    uri = _r2_uri(key)
-    fs = get_fs(uri)
-    fs.put_file(path, uri)
+    backend.upload_file(path, _r2_uri(key))
 
 
 def _r2_download_bytes(key: str) -> bytes | None:
-    uri = _r2_uri(key)
-    fs = get_fs(uri)
-    try:
-        with fs.open(uri, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
+    return backend.read_bytes(_r2_uri(key))
 
 
 # =============================================================================
@@ -134,65 +120,6 @@ class MemoryProfiler:
                 break
 
             self._stop.wait(self.interval)
-
-
-# =============================================================================
-# Self-retrigger via GitHub API
-# =============================================================================
-
-def _self_retrigger(run_id: str) -> bool:
-    """Dispatch our own workflow with the same run_id, so a long ingest
-    survives GHA's 6h job cap without requiring per-workflow retrigger steps.
-
-    Why a PAT: GITHUB_TOKEN cannot dispatch workflows on its own repo (GHA
-    blocks recursion). A user/fine-grained PAT with `actions:write` does.
-    """
-    pat = os.environ.get("GH_RETRIGGER_PAT")
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    if not pat:
-        print("[runner] GH_RETRIGGER_PAT not set; cannot self-retrigger")
-        return False
-    if not repo:
-        print("[runner] GITHUB_REPOSITORY not set; cannot self-retrigger")
-        return False
-
-    ref = os.environ.get("GITHUB_REF_NAME") or "main"
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/run.yml/dispatches"
-    # The single-repo connectors workflow requires `slug`; carry the DAG
-    # params too so the continuation run resumes with identical scope.
-    inputs = {"run_id": run_id, "slug": get_connector_name()}
-    for env_key, input_key in (("DAG_TARGET", "dag_target"),
-                               ("DAG_ON_FAILURE", "dag_on_failure")):
-        val = os.environ.get(env_key)
-        if val:
-            inputs[input_key] = val
-    body = json.dumps({"ref": ref, "inputs": inputs}).encode()
-
-    import urllib.request
-    import urllib.error
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={
-            "Authorization": f"Bearer {pat}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status in (200, 204):
-                print(f"[runner] Self-retriggered run.yml on {repo}@{ref} with run_id={run_id}")
-                return True
-            print(f"[runner] Self-retrigger HTTP {resp.status}")
-            return False
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[runner] Self-retrigger HTTP {e.code}: {body}")
-        return False
-    except Exception as e:
-        print(f"[runner] Self-retrigger failed: {e}")
-        return False
 
 
 # =============================================================================
@@ -298,126 +225,98 @@ def _resolve_exit_code(subprocess_exit: int, run_status: str | None) -> int:
 # Main
 # =============================================================================
 
-def _build_server_run_payload(connector: str, run_id: str, log_dir: Path) -> dict | None:
-    """Build a server-compatible run payload from local run artifacts.
-
-    Reads run.json (DAG, materializations), memory.csv, and output.log,
-    then enriches with GitHub Actions and git context from environment.
-    Returns None if run.json is missing or invalid.
-    """
-    run_json_path = log_dir / "run.json"
-    if not run_json_path.exists():
+def _peak_memory_bytes(log_dir: Path) -> int | None:
+    """Peak RSS across the run from memory.csv, in bytes. None if unavailable."""
+    memory_csv = log_dir / "memory.csv"
+    if not memory_csv.exists():
         return None
-
     try:
-        run_data = json.loads(run_json_path.read_text())
+        peak_rss = 0.0
+        with open(memory_csv) as f:
+            for row in csv.DictReader(f):
+                rss_mb = float(row["rss_mb"])
+                if rss_mb > peak_rss:
+                    peak_rss = rss_mb
+        return int(peak_rss * 1024 * 1024)
     except Exception:
         return None
 
-    # Map orchestrator materializations to server format
-    materializations = []
-    for node in run_data.get("dag", {}).get("nodes", []):
-        for m in node.get("materializations", []):
-            materializations.append({
-                "dataset_id": m.get("name", ""),
-                "version": m.get("version", 0),
-                "hash": m.get("hash"),
-            })
 
-    # Parse memory.csv → memory_samples
-    memory_samples = []
-    peak_memory_bytes = None
-    memory_csv = log_dir / "memory.csv"
-    if memory_csv.exists():
-        try:
-            import csv as csv_mod
-            with open(memory_csv) as f:
-                reader = csv_mod.DictReader(f)
-                peak_rss = 0
-                for row in reader:
-                    rss_mb = float(row["rss_mb"])
-                    vms_mb = float(row["vms_mb"])
-                    memory_samples.append({
-                        "t": row["timestamp"],
-                        "rss": rss_mb,
-                        "vms": vms_mb,
-                    })
-                    if rss_mb > peak_rss:
-                        peak_rss = rss_mb
-                peak_memory_bytes = int(peak_rss * 1024 * 1024)
-        except Exception:
-            pass
+def _http_index(log_dir: Path) -> dict[str, dict]:
+    """Derive a per-nodespec {count, error_count} index from http_requests.csv.
 
-    # Read log output
-    log_text = None
-    output_log = log_dir / "output.log"
-    if output_log.exists():
-        try:
-            log_text = output_log.read_text()
-        except Exception:
-            pass
+    The csv is the source of truth for HTTP (every request, one row). This is
+    the single-pass reduction stamped into run.json — the same shape as
+    _peak_memory_bytes derives from memory.csv. A request is a failure if it
+    errored or returned status >= 400. Returns {} if the csv is missing/empty.
+    """
+    csv_path = log_dir / "http_requests.csv"
+    if not csv_path.exists():
+        return {}
+    index: dict[str, dict] = {}
+    try:
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                node = row.get("nodespec") or ""
+                bucket = index.setdefault(node, {"count": 0, "error_count": 0})
+                bucket["count"] += 1
+                status = row.get("status") or ""
+                is_failure = bool(row.get("error")) or (
+                    status.isdigit() and int(status) >= 400
+                )
+                if is_failure:
+                    bucket["error_count"] += 1
+    except Exception:
+        return {}
+    return index
 
-    # Compute duration
-    started_at = run_data.get("started_at")
-    finished_at = run_data.get("finished_at")
-    duration_seconds = None
-    if started_at and finished_at:
-        try:
-            t0 = datetime.fromisoformat(started_at)
-            t1 = datetime.fromisoformat(finished_at)
-            duration_seconds = (t1 - t0).total_seconds()
-        except Exception:
-            pass
 
-    # Determine platform
-    platform = "github_actions" if os.environ.get("GITHUB_RUN_ID") else "local"
+def _stamp_run_enrichments(log_dir: Path) -> None:
+    """Stamp supervisor-side context into run.json in place, before evacuation.
 
-    # Build server-compatible payload
-    status_map = {"done": "success", "failed": "failed", "needs_continuation": "running"}
-    server_status = status_map.get(run_data.get("status", ""), "failed")
+    run.json is the single canonical run artifact — the orchestrator owns its
+    body (status, DAG, lineage, HTTP, state), and the supervisor adds the few
+    facts only it knows: GitHub Actions identity, git commit, peak memory. The
+    enriched file evacuates with the rest of LOG_DIR; there is no second,
+    reshaped copy. No-op if run.json is missing/invalid.
+    """
+    p = log_dir / "run.json"
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return
 
-    payload = {
-        "id": f"run_{connector}_{run_id}",
-        "status": server_status,
-        "platform": platform,
-        "git_commit": os.environ.get("GITHUB_SHA") or run_data.get("git_hash"),
-        "git_dirty": False if os.environ.get("CI") else None,
-        "started_at": started_at,
-        "completed_at": finished_at,
-        "duration_seconds": duration_seconds,
-        "peak_memory_bytes": peak_memory_bytes,
-        "materializations": materializations,
-        "dag": run_data.get("dag"),
-        "memory_samples": memory_samples or None,
-        "log": log_text,
-        "connector": connector,
-    }
+    git_commit = os.environ.get("GITHUB_SHA")
+    if git_commit:
+        data["git_commit"] = git_commit
+
+    peak = _peak_memory_bytes(log_dir)
+    if peak is not None:
+        data["peak_memory_bytes"] = peak
+
+    # Derive the per-node HTTP index from http_requests.csv and inject it into
+    # each node's record. Done here (the supervisor, after the subprocess exits)
+    # so the index survives even when the orchestrator was hard-killed mid-run —
+    # the same robustness as peak_memory_bytes. The csv stays the full firehose.
+    http_index = _http_index(log_dir)
+    if http_index:
+        for node in data.get("dag", {}).get("nodes", []):
+            stats = http_index.get(node.get("id"))
+            if stats:
+                node["http"] = stats
 
     gh_run_id = os.environ.get("GITHUB_RUN_ID")
     if gh_run_id:
-        payload["github_run_id"] = gh_run_id
+        data["github_run_id"] = gh_run_id
         gh_repo = os.environ.get("GITHUB_REPOSITORY", "")
-        payload["github_run_url"] = (
-            f"https://github.com/{gh_repo}/actions/runs/{gh_run_id}"
-        )
+        data["github_run_url"] = f"https://github.com/{gh_repo}/actions/runs/{gh_run_id}"
 
-    return payload
-
-
-def _upload_server_run_manifest(connector: str, run_id: str, log_dir: Path):
-    """Upload enriched run manifest to the server-accessible R2 path."""
-    payload = _build_server_run_payload(connector, run_id, log_dir)
-    if payload is None:
-        print("[runner] No run.json found, skipping server manifest upload")
-        return
-
-    key = f"subsetsv2/runs/{connector}/run_{connector}_{run_id}.json"
     try:
-        data = json.dumps(payload, indent=2).encode()
-        _r2_upload_bytes(data, key)
-        print(f"[runner] Uploaded server run manifest to {key}")
-    except Exception as e:
-        print(f"[runner] Failed to upload server manifest: {e}")
+        p.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
 
 
 def _expand_bundled_secrets() -> None:
@@ -456,13 +355,7 @@ def main():
     # Export the resolved RUN_ID to $GITHUB_OUTPUT so the workflow's retrigger
     # step can pass it back as run_id input — preserving DAG resume across
     # retriggers even when the first invocation was started without one.
-    gh_output = os.environ.get("GITHUB_OUTPUT")
-    if gh_output:
-        try:
-            with open(gh_output, "a") as f:
-                f.write(f"resolved_run_id={run_id}\n")
-        except OSError:
-            pass
+    platform_github.write_resolved_run_id(run_id)
 
     # LOG_DIR: same path locally and in cloud, only the prefix differs
     log_dir = Path("/tmp/logs" if is_cloud() else "logs") / run_id
@@ -492,12 +385,10 @@ def main():
         print(f"  Resuming with prior run.json from {source}")
     print(f"Log directory: {log_dir}")
     if is_cloud():
-        print(f"Raw scope:     s3://{get_bucket_name()}/{get_r2_base()}/runs/{run_id}/raw")
+        print(f"Raw scope:     s3://{get_bucket_name()}/{get_r2_run_base()}/raw")
     else:
-        print(f"Raw scope:     {get_data_dir()}/runs/{run_id}/raw")
+        print(f"Raw scope:     {get_data_dir()}/raw")
     print("-" * 60)
-
-    debug.log_run_start()
 
     env = os.environ.copy()
     src_path = str(Path.cwd() / "src")
@@ -597,7 +488,7 @@ def main():
     # that still have an in-YAML retrigger step act as a fallback.
     continuation_dispatched = False
     if exit_code == 2 and is_cloud():
-        if _self_retrigger(run_id):
+        if platform_github.maybe_retrigger(run_id):
             exit_code = 0
             continuation_dispatched = True
 
@@ -607,13 +498,11 @@ def main():
             print(f"Continuation dispatched — workflow will retrigger with run_id={run_id}")
         else:
             print(f"Connector completed successfully (run.json status='done')")
-        debug.log_run_end(status="completed")
     elif exit_code == 2:
         if run_status == "needs_continuation":
             print(f"Continuation needed (run.json status='needs_continuation') - exit 2 to retrigger")
         else:
             print(f"Subprocess died (exit {subprocess_exit}) but run partially complete - exit 2 to retrigger")
-        debug.log_run_end(status="continuation")
     else:
         if subprocess_exit == 137:
             error_msg = "Exit code 137 - Out of memory (no progress to resume)"
@@ -623,12 +512,17 @@ def main():
             error_msg = f"Subprocess exit code {subprocess_exit}, run.json status={run_status}"
         print(f"Connector failed: {error_msg}")
         write_error_log(log_dir, subprocess_exit, output_file)
-        debug.log_run_end(status="failed", error=error_msg)
+
+    # Stamp supervisor-side context (git commit, GitHub identity, peak memory)
+    # into run.json so the single canonical artifact carries it — then let the
+    # whole directory evacuate. No reshape, no second copy.
+    _stamp_run_enrichments(log_dir)
 
     # Cloud: raw + state already live in R2 (connectors write direct via
-    # fsspec/s3fs). Only logs need to be evacuated.
+    # fsspec/s3fs). Only logs need to be evacuated. Uploading the whole LOG_DIR
+    # is THE evacuation mechanism — every artifact (run.json, output.log,
+    # memory.csv, error.txt) lands under <connector>/runs/<run_id>/ verbatim.
     if is_cloud():
-        # Evacuate invocation logs to R2 under <connector>/runs/<run_id>/
         prefix = _connector_runs_prefix(connector, run_id)
         print(f"Uploading logs to R2 under {prefix}/...")
         for log in log_dir.rglob("*"):
@@ -639,9 +533,6 @@ def main():
                     print(f"  -> {key}")
                 except Exception as e:
                     print(f"  Failed to upload {log.name}: {e}")
-
-        # Upload enriched run manifest to server-accessible R2 path
-        _upload_server_run_manifest(connector, run_id, log_dir)
 
     sys.exit(exit_code)
 

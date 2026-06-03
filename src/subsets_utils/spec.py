@@ -16,10 +16,33 @@ class NodeSpec:
     `id` must be globally unique within a connector's loaded specs.
     `kind` is matched against DAG_TARGET when filtering (e.g. "download",
     "transform"). It also routes per-stage status in manifests.
+
+    `deps` lists the ids of other NodeSpecs that must finish successfully
+    before this node is spawned. Default `()` means independent (the historical
+    behavior — every node ready immediately, run in declaration order). Pass a
+    list of ids to gate a node behind others (e.g. a transform that reads what a
+    download wrote). The DAG topologically orders nodes by their deps; a node
+    whose dependency fails or is blocked is itself marked failed rather than
+    run. Unknown dep ids and dependency cycles fail at DAG construction. Stored
+    as a tuple so the frozen spec stays hashable; you may pass any iterable.
     """
     id: str
     fn: Callable
     kind: str = "download"
+    deps: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        # Normalize deps to a tuple so the frozen dataclass stays hashable and
+        # immutable while still accepting the ergonomic `deps=[...]` list form.
+        # Guard against a bare string, which tuple() would silently shred into
+        # one entry per character.
+        if isinstance(self.deps, str):
+            raise TypeError(
+                f"NodeSpec {self.id!r}: deps must be a list/tuple of ids, "
+                f"not a str ({self.deps!r})"
+            )
+        if not isinstance(self.deps, tuple):
+            object.__setattr__(self, "deps", tuple(self.deps))
 
 
 @dataclass(frozen=True)

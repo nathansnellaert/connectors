@@ -1,25 +1,18 @@
 """DuckDB utilities for querying raw data."""
 
-import os
 import duckdb
-from .config import is_cloud, raw_uri
+from .config import raw_uri
+from .storage import backend
 
 _configured = False
 
 
 def _configure():
-    """Auto-configure DuckDB for S3 if in cloud mode."""
+    """Auto-configure DuckDB for S3 if in cloud mode (delegates to StorageBackend)."""
     global _configured
     if _configured:
         return
-
-    if is_cloud():
-        duckdb.sql(f"""
-            SET s3_endpoint='{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com';
-            SET s3_access_key_id='{os.environ['R2_ACCESS_KEY_ID']}';
-            SET s3_secret_access_key='{os.environ['R2_SECRET_ACCESS_KEY']}';
-            SET s3_region='auto';
-        """)
+    backend.duckdb_setup()
     _configured = True
 
 

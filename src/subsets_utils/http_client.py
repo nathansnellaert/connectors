@@ -1,7 +1,7 @@
 import os
 import httpx
 import time
-from . import debug
+from . import tracking
 
 _client = None
 _client_config = {
@@ -24,7 +24,7 @@ def _get_or_create_client() -> httpx.Client:
 
 
 def _logged_request(method: str, url: str, **kwargs) -> httpx.Response:
-    """Execute HTTP request with logging if ENABLE_LOGGING is set."""
+    """Execute an HTTP request, recording it into the run record."""
     client = _get_or_create_client()
     start = time.time()
     error = None
@@ -39,7 +39,7 @@ def _logged_request(method: str, url: str, **kwargs) -> httpx.Response:
         raise
     finally:
         duration_ms = int((time.time() - start) * 1000)
-        debug.log_http_request(method, url, status, duration_ms=duration_ms, error=error)
+        tracking.record_http(method, url, status, duration_ms=duration_ms, error=error)
 
 
 def get(url: str, **kwargs) -> httpx.Response:

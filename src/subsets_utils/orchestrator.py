@@ -1,9 +1,10 @@
 """DAG orchestration with run-state persistence.
 
 The DAG class:
-- Runs each NodeSpec in declaration order, each in a fresh forked subprocess
-  (memory isolation per node). Nodes are independent — there is no
-  cross-node sequencing; ordering is just the order specs are declared.
+- Runs each NodeSpec in dependency order (topological sort), each in a fresh
+  forked subprocess (memory isolation per node). A node with no deps is ready
+  immediately; nodes with deps wait until every dependency has completed
+  successfully. Ties (independent nodes) keep declaration order.
 - Runs each node in a fresh forked subprocess (memory isolation per node)
 - Writes run.json after each node
 - Marks status as "needs_continuation" if any node returns True (pagination)
@@ -43,7 +44,6 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -53,7 +53,6 @@ from .io import record_completion, _load_state_raw
 from .spec import MaintainSpec, NodeSpec
 from .spec_hash import compute_spec_hash
 from .tracking import (
-    IORecord,
     clear_tracking,
     get_asset_version,
     get_assets_by_writer,
@@ -80,10 +79,54 @@ _MAX_RESULT_PICKLE_BYTES = 10 * 1024 * 1024
 
 
 def _topology_hash(specs: list[NodeSpec]) -> str:
-    """Hash of the node set — used to detect changes between invocations.
-    With no inter-node deps, "topology" is just the set of (id, kind)."""
-    items = sorted((spec.id, spec.kind) for spec in specs)
+    """Hash of the graph — used to detect changes between invocations.
+    Topology is the set of (id, kind, sorted deps), so adding/removing an edge
+    changes the hash."""
+    items = sorted(
+        (spec.id, spec.kind, sorted(spec.deps)) for spec in specs
+    )
     return hashlib.md5(json.dumps(items).encode()).hexdigest()[:16]
+
+
+def _validate_deps(specs_by_id: dict[str, NodeSpec]) -> None:
+    """Reject unknown dep ids, self-deps, and cycles. Raises ValueError naming
+    the offending node (and, for cycles, the full cycle path)."""
+    for s in specs_by_id.values():
+        for d in s.deps:
+            if d == s.id:
+                raise ValueError(f"NodeSpec {s.id!r} depends on itself")
+            if d not in specs_by_id:
+                raise ValueError(f"NodeSpec {s.id!r} declares unknown dep {d!r}")
+
+    # Iterative DFS with WHITE/GREY/BLACK coloring to find a cycle and report
+    # the path. GREY = on the current DFS stack; hitting a GREY node is a cycle.
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {sid: WHITE for sid in specs_by_id}
+    for root in specs_by_id:
+        if color[root] != WHITE:
+            continue
+        stack: list[tuple[str, int]] = [(root, 0)]
+        path: list[str] = []
+        while stack:
+            node, i = stack[-1]
+            if i == 0:
+                color[node] = GREY
+                path.append(node)
+            deps = specs_by_id[node].deps
+            if i < len(deps):
+                stack[-1] = (node, i + 1)
+                nxt = deps[i]
+                if color[nxt] == GREY:
+                    cycle = path[path.index(nxt):] + [nxt]
+                    raise ValueError(
+                        "NodeSpec dependency cycle: " + " -> ".join(cycle)
+                    )
+                if color[nxt] == WHITE:
+                    stack.append((nxt, 0))
+            else:
+                color[node] = BLACK
+                path.pop()
+                stack.pop()
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -129,11 +172,7 @@ def _child_entrypoint(fn: Callable, args: tuple, task_id: str, pipe_w) -> None:
             "needs_continuation": bool,        # only when status == "done"
             "error": str (only on failed),
             "traceback": str (only on failed),
-            "tracking": {
-                "asset_writers": {asset_path: task_id},
-                "asset_versions": {asset_path: {"version": int, "hash": str}},
-                "io_records": [{"asset_path", "task_id", "operation", "stack"}],
-            }
+            "tracking": tracking.snapshot()  # lineage + bounded HTTP + state
         }
     """
     # Reset signal handlers in the child — supervisor's SIGTERM handler is
@@ -172,11 +211,7 @@ def _child_entrypoint(fn: Callable, args: tuple, task_id: str, pipe_w) -> None:
     except Exception:
         result["duration_s"] = 0.0
 
-    result["tracking"] = {
-        "asset_writers": dict(tracking._asset_writers),
-        "asset_versions": dict(tracking._asset_versions),
-        "io_records": [asdict(r) for r in tracking._io_records],
-    }
+    result["tracking"] = tracking.snapshot()
 
     # Flush stdio before sending result. Fork-inherited pipes can drop the
     # last buffered line if the child exits without flushing.
@@ -202,7 +237,7 @@ def _child_entrypoint(fn: Callable, args: tuple, task_id: str, pipe_w) -> None:
                 "error": f"failed to serialize result: {e}",
                 "traceback": traceback.format_exc(),
                 "needs_continuation": False,
-                "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
+                "tracking": {},
             })
             pipe_w.send_bytes(fallback)
         except Exception:
@@ -226,6 +261,12 @@ class DAG:
             if s.id in seen:
                 raise ValueError(f"Duplicate NodeSpec id: {s.id!r}")
             seen[s.id] = s
+
+        # Validate deps: every referenced id must exist (forward references to
+        # later-declared specs are fine), no node may depend on itself, and the
+        # graph must be acyclic. Caught here so a bad graph fails fast at
+        # construction rather than deadlocking the run loop.
+        _validate_deps(seen)
 
         # Maintain specs: keyed by asset_id. An asset_id with no matching
         # NodeSpec is a no-op (warned but not fatal — keeps the runtime tolerant
@@ -254,6 +295,7 @@ class DAG:
             self.state[spec.id] = {
                 "id": spec.id,
                 "kind": spec.kind,
+                "deps": list(spec.deps),
                 # Where the fetch/transform fn was def'd — for debugging.
                 # functools.wraps preserves this through decorators (@tenacity.retry etc).
                 "source_module": getattr(spec.fn, "__module__", None),
@@ -317,9 +359,36 @@ class DAG:
     # =========================================================================
 
     def _execution_order(self) -> list[NodeSpec]:
-        """Return specs in declaration order. Nodes are independent — there
-        are no inter-node deps to order by."""
-        return list(self._specs.values())
+        """Return specs topologically ordered by their deps, breaking ties in
+        declaration order. Deps are validated acyclic at construction, so
+        Kahn's algorithm always drains every node."""
+        specs = list(self._specs.values())
+        decl_index = {s.id: i for i, s in enumerate(specs)}
+        indeg = {s.id: len(s.deps) for s in specs}
+        dependents: dict[str, list[str]] = {s.id: [] for s in specs}
+        for s in specs:
+            for d in s.deps:
+                dependents[d].append(s.id)
+
+        ready = [s.id for s in specs if indeg[s.id] == 0]
+        ordered: list[str] = []
+        while ready:
+            # Pop the earliest-declared ready node for a stable, deterministic
+            # order among nodes with no remaining dependency.
+            ready.sort(key=lambda sid: decl_index[sid])
+            nid = ready.pop(0)
+            ordered.append(nid)
+            for dep_id in dependents[nid]:
+                indeg[dep_id] -= 1
+                if indeg[dep_id] == 0:
+                    ready.append(dep_id)
+
+        # Acyclicity is enforced at construction; this is a belt-and-suspenders
+        # guard in case specs were mutated after __init__.
+        if len(ordered) != len(specs):
+            stuck = sorted(set(self._specs) - set(ordered))
+            raise ValueError(f"NodeSpec dependency cycle among: {stuck}")
+        return [self._specs[i] for i in ordered]
 
     # =========================================================================
     # Maintain
@@ -459,7 +528,7 @@ class DAG:
             "finished_at": now,
             "duration_s": 0.0,
             "needs_continuation": False,
-            "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
+            "tracking": {},
         }
 
     def _apply_result(self, task_id: str, result: dict) -> None:
@@ -489,14 +558,9 @@ class DAG:
                 # Don't let a state-write hiccup tank an otherwise successful node.
                 print(f"[DAG] WARN: record_completion failed for {task_id}: {type(e).__name__}: {e}")
 
-        # Merge child's tracking snapshot into the supervisor's tracking module
-        # so to_json() and _print_node_detail() see this node's I/O.
-        snapshot = result.get("tracking") or {}
-        with tracking._lock:
-            tracking._asset_writers.update(snapshot.get("asset_writers", {}))
-            tracking._asset_versions.update(snapshot.get("asset_versions", {}))
-            for r in snapshot.get("io_records", []):
-                tracking._io_records.append(IORecord(**r))
+        # Merge child's run-record snapshot into the supervisor's record so
+        # to_json() and _print_node_detail() see this node's I/O, HTTP, state.
+        tracking.merge(result.get("tracking") or {})
 
     def run(self, targets: list[str] | None = None):
         """Execute all nodes in dependency order, each in its own forked
@@ -529,6 +593,10 @@ class DAG:
             - The DAG class never calls sys.exit() — exit codes are runner.py's job.
         """
         clear_tracking()
+        # Create http_requests.csv (header only) once, in this single process,
+        # before any node forks — children only append rows. Per-invocation,
+        # like output.log / memory.csv.
+        tracking.init_http_log()
 
         on_failure = os.environ.get("DAG_ON_FAILURE", "crash")
         try:
@@ -616,10 +684,39 @@ class DAG:
         stop_submitting = False
         consecutive_failures = 0
 
+        def propagate_blocked() -> None:
+            """Mark any pending node whose dependency has failed as failed
+            itself (it can never become ready), so the run terminates instead of
+            spinning on un-runnable nodes. Cascades to fixpoint: blocking a node
+            may block its own dependents. Does NOT set first_failure — the
+            originating dependency already accounted for that.
+
+            A dep that is `done` (incl. maintain-skipped, DAG_TARGET-filtered, or
+            DAG_SKIP_DOWNLOAD-marked) is satisfied; only `failed` deps block."""
+            changed = True
+            while changed:
+                changed = False
+                for s in order:
+                    st = self.state[s.id]
+                    if st["status"] != "pending":
+                        continue
+                    bad = [d for d in s.deps if self.state[d]["status"] == "failed"]
+                    if bad:
+                        st["status"] = "failed"
+                        st["error"] = f"skipped: dependency failed ({', '.join(bad)})"
+                        st["skipped_blocked"] = True
+                        print(f"[DAG] {s.id} blocked — dependency failed: {', '.join(bad)}")
+                        changed = True
+            self.save_state()
+
         def find_ready() -> list[NodeSpec]:
-            """Return every pending spec, in declaration order. Nodes are
-            independent — none gate on another, so any pending node is ready."""
-            return [s for s in order if self.state[s.id]["status"] == "pending"]
+            """Return pending specs whose every dep has completed (`done`), in
+            declaration order. A node with no deps is ready immediately."""
+            return [
+                s for s in order
+                if self.state[s.id]["status"] == "pending"
+                and all(self.state[d]["status"] == "done" for d in s.deps)
+            ]
 
         # Each node runs in its own forked subprocess so memory is reclaimed
         # between nodes. in_flight maps a live Process to its (task_id, pipe_r).
@@ -698,6 +795,7 @@ class DAG:
                 # Map sentinels back to processes. multiprocessing.connection.wait
                 # returns the sentinel objects; we match by identity.
                 done_procs = [p for p in list(in_flight) if p.sentinel in ready]
+                batch_had_failure = False
                 for proc in done_procs:
                     task_id, _ = in_flight[proc]
                     result = collect_one(proc)
@@ -710,6 +808,7 @@ class DAG:
                             self._print_node_detail(task_id)
                         consecutive_failures = 0
                     else:
+                        batch_had_failure = True
                         print(f"[DAG] {task_id} failed: {result.get('error', 'unknown')}")
                         if first_failure is None:
                             first_failure = result
@@ -722,12 +821,35 @@ class DAG:
                                   f"Likely a systemic issue — fix and rerun.")
                             stop_submitting = True
 
+                # A failure orphans its (transitive) dependents — they can never
+                # be ready. Mark them failed so the loop terminates instead of
+                # spinning with an empty find_ready() over un-runnable pendings.
+                if batch_had_failure:
+                    propagate_blocked()
+
                 if self._shutdown_requested:
                     break
 
                 submit_more()
 
-            # Drain any remaining in-flight children after a shutdown signal.
+                # Deadline watchdog. submit_more() flips _deadline_hit (and
+                # _needs_continuation) once the time budget is spent, but a
+                # single long-running node would otherwise keep us blocked in
+                # this loop until GHA's hard timeout SIGKILLs the whole job —
+                # leaving run.json unfinalized, logs un-uploaded, and no
+                # retrigger (the 2026-06-01 mass-failure mode). Break out now so
+                # the drain block below force-kills the stragglers and we exit
+                # cleanly as needs_continuation with ~10 min of margin to spare.
+                if self._deadline_hit and in_flight:
+                    print(f"[DAG] Deadline watchdog: interrupting {len(in_flight)} "
+                          f"in-flight node(s) to finalize continuation")
+                    break
+
+            # Drain any remaining in-flight children after a shutdown signal OR a
+            # budget-deadline interrupt. There are no connector-side teardown
+            # hooks, so this grace window is NOT for cleanup — it's a last chance
+            # to collect a real result from any child that happens to finish in
+            # the next few seconds, after which we hard-kill the rest.
             if in_flight:
                 drain_timeout = float(os.environ.get("DAG_DRAIN_TIMEOUT_S", "8"))
                 deadline = time.monotonic() + drain_timeout
@@ -754,23 +876,44 @@ class DAG:
                             proc.join(timeout=2)
                         except Exception:
                             pass
-                    # Synthesize a failure result for shutdown-killed nodes.
+                    # Account for the force-killed node — two distinct cases.
                     in_flight.pop(proc, None)
-                    now = datetime.now(timezone.utc).isoformat()
-                    self._apply_result(task_id, {
-                        "task_id": task_id,
-                        "status": "failed",
-                        "error": "killed during shutdown",
-                        "traceback": "",
-                        "started_at": self.state[task_id].get("started_at") or now,
-                        "finished_at": now,
-                        "duration_s": 0.0,
-                        "needs_continuation": False,
-                        "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
-                    })
-                    self.save_state()
-                    if first_failure is None:
-                        first_failure = self.state[task_id]
+                    if self._deadline_hit:
+                        # Budget-deadline interrupt: the node didn't fail, it ran
+                        # out of wall-clock. Reset it to "pending" so
+                        # _overall_status() reports needs_continuation — a node
+                        # left as "failed" would force the whole run to
+                        # status="failed", which suppresses the retrigger and
+                        # re-creates the original bug. The continuation run
+                        # re-derives it fresh via maintain-skip freshness; any
+                        # partial raw is simply re-fetched. Deliberately does NOT
+                        # set first_failure (no exception, no exit-1).
+                        st = self.state[task_id]
+                        st["status"] = "pending"
+                        st["error"] = None
+                        st["finished_at"] = None
+                        st["interrupted_at_deadline"] = True
+                        print(f"[DAG] {task_id}: interrupted at deadline → pending "
+                              f"(continuation will resume it)")
+                        self.save_state()
+                    else:
+                        # Shutdown (SIGTERM/crash) kill: a host-initiated stop is a
+                        # real failure — no auto-retrigger from host kill.
+                        now = datetime.now(timezone.utc).isoformat()
+                        self._apply_result(task_id, {
+                            "task_id": task_id,
+                            "status": "failed",
+                            "error": "killed during shutdown",
+                            "traceback": "",
+                            "started_at": self.state[task_id].get("started_at") or now,
+                            "finished_at": now,
+                            "duration_s": 0.0,
+                            "needs_continuation": False,
+                            "tracking": {},
+                        })
+                        self.save_state()
+                        if first_failure is None:
+                            first_failure = self.state[task_id]
         finally:
             # Restore prior signal handler (mostly relevant for tests / repeated runs).
             try:
@@ -865,6 +1008,14 @@ class DAG:
                 merged["subsets_reads"] = subsets_reads or merged.get("subsets_reads", [])
             if materializations or not merged.get("materializations"):
                 merged["materializations"] = materializations or merged.get("materializations", [])
+
+            # Full state-change list, carried into this process by the child's
+            # snapshot/merge. (Per-node HTTP {count, error_count} is NOT set
+            # here — it's derived from http_requests.csv at finalize by
+            # runner._stamp_run_enrichments and injected into dag.nodes[].http.)
+            state_changes = tracking.get_state_changes(task_id)
+            if state_changes or not merged.get("state_changes"):
+                merged["state_changes"] = state_changes or merged.get("state_changes", [])
             nodes_with_io.append(merged)
 
         return {
@@ -882,8 +1033,12 @@ class DAG:
             ),
             "dag": {
                 "nodes": nodes_with_io,
-                # Nodes are independent — no inter-node edges.
-                "edges": [],
+                # One edge per declared dependency: {"from": dep, "to": node}.
+                "edges": [
+                    {"from": d, "to": spec.id}
+                    for spec in self._specs.values()
+                    for d in spec.deps
+                ],
                 "total_duration_s": sum(
                     n.get("duration_s") or 0 for n in self.state.values()
                 ),

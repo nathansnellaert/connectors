@@ -46,6 +46,9 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           CI: "true"
+          # Capture http/data/run/state CSVs into LOG_DIR (evacuated to R2
+          # with the rest of the logs). Opt-in flag, default-on for cloud runs.
+          ENABLE_LOGGING: "true"
           CONNECTOR_NAME: ${{ inputs.slug }}
           RUN_ID: ${{ inputs.run_id }}
           DAG_TARGET: ${{ inputs.dag_target }}

@@ -47,7 +47,7 @@ from tenacity import (
 from subsets_utils import (
     NodeSpec,
     configure_http,
-    get,
+    get_client,
     load_state,
     save_raw_file,
     save_raw_parquet,
@@ -101,6 +101,18 @@ CATALOG_PAGE_SIZE = 150          # FromShowColumns results per page
 MAX_PAGES_PER_CATEGORY = 100     # safety ceiling (15k series/category is absurd)
 MAX_FETCH_SECONDS = 1500         # soft per-run budget (~25 min); resume next run
 
+# Per-request limits. httpx's connect/read/write/pool timeouts each bound a
+# single socket operation — but `read` is reset on every received byte, so a
+# server that trickles or stalls the body (e.g. Akamai bot-mitigation against a
+# datacenter IP returns 200 then drips bytes) keeps every read under the window
+# forever and the request never returns. A previous run hung a single static
+# fetch this way and rode GitHub's 6h job ceiling to a cancel with zero output.
+# We therefore ALSO enforce a hard wall-clock ceiling on the whole request
+# (headers + full body) and a max body size, by streaming the response.
+_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=30.0)
+MAX_REQUEST_SECONDS = 240        # hard ceiling on ONE request, incl. body read
+MAX_RESPONSE_BYTES = 256 * 1024 * 1024  # 256 MB — research files are << this
+
 IADB_SPEC_ID = "bank-of-england-iadb-observations"
 
 # Raw observation schema (long format). Values kept as strings in the raw layer
@@ -132,16 +144,60 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+class _Resp:
+    """Minimal streamed-response view exposing only what callers use
+    (`.content`, `.text`, `.status_code`). The full body is read under a
+    wall-clock + size ceiling before this is returned, so no caller can block
+    on a half-delivered body."""
+
+    __slots__ = ("status_code", "content", "_encoding")
+
+    def __init__(self, status_code: int, content: bytes, encoding: str | None):
+        self.status_code = status_code
+        self.content = content
+        self._encoding = encoding
+
+    @property
+    def text(self) -> str:
+        enc = self._encoding or "utf-8"
+        try:
+            return self.content.decode(enc, errors="replace")
+        except LookupError:  # bogus charset label in the header
+            return self.content.decode("utf-8", errors="replace")
+
+
 @retry(
     retry=retry_if_exception(_is_transient),
     stop=stop_after_attempt(6),
     wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
-def _request(url: str, params: dict | None = None) -> httpx.Response:
-    resp = get(url, params=params, timeout=(15.0, 180.0))
-    resp.raise_for_status()
-    return resp
+def _request(url: str, params: dict | None = None) -> _Resp:
+    client = get_client()  # shared client; configure_http set the browser UA
+    start = time.monotonic()
+    with client.stream("GET", url, params=params, timeout=_HTTP_TIMEOUT) as resp:
+        resp.raise_for_status()
+        encoding = resp.charset_encoding  # header-only; no body read needed
+        parts: list[bytes] = []
+        size = 0
+        for chunk in resp.iter_bytes():
+            parts.append(chunk)
+            size += len(chunk)
+            if size > MAX_RESPONSE_BYTES:
+                raise RuntimeError(
+                    f"response body exceeded {MAX_RESPONSE_BYTES} bytes from {url}"
+                )
+            if time.monotonic() - start > MAX_REQUEST_SECONDS:
+                # Slow-trickle / stalled body: the per-read timeout never trips
+                # because each chunk arrives inside the read window. Enforce the
+                # total-time ceiling ourselves. Raised as ReadTimeout so the
+                # retry layer (which treats it as transient) gives a few more
+                # shots before the node fails honestly instead of hanging.
+                raise httpx.ReadTimeout(
+                    f"total request time exceeded {MAX_REQUEST_SECONDS}s from {url}",
+                    request=resp.request,
+                )
+        return _Resp(resp.status_code, b"".join(parts), encoding)
 
 
 # --------------------------------------------------------------------------
@@ -208,12 +264,22 @@ def _cat_fingerprint(cats: list[dict]) -> str:
     return h.hexdigest()
 
 
-def _series_codes_for_category(cat_params: dict, _session_retried: bool = False) -> list[str]:
-    """Page through a category's FromShowColumns listing, collecting series codes."""
+def _series_codes_for_category(
+    cat_params: dict,
+    deadline: float | None = None,
+    _session_retried: bool = False,
+) -> list[str]:
+    """Page through a category's FromShowColumns listing, collecting series codes.
+
+    `deadline` (a time.monotonic() value) bounds the paging so one large or slow
+    category can't blow the per-run budget — the page cap alone is not enough
+    when each page request is itself slow."""
     codes: list[str] = []
     total: int | None = None
     page = 1
     while True:
+        if deadline is not None and time.monotonic() > deadline:
+            return list(dict.fromkeys(codes))
         params = dict(cat_params)
         if page > 1:
             params["ShadowPage"] = str(page)
@@ -222,7 +288,8 @@ def _series_codes_for_category(cat_params: dict, _session_retried: bool = False)
             # Likely an expired session cookie — refresh once and retry.
             if not _session_retried:
                 _refresh_session()
-                return _series_codes_for_category(cat_params, _session_retried=True)
+                return _series_codes_for_category(
+                    cat_params, deadline=deadline, _session_retried=True)
             print(f"[iadb] category errored after session refresh: "
                   f"{cat_params.get('HighlightCatValueDisplay', '?')[:40]}", flush=True)
             return list(dict.fromkeys(codes))
@@ -340,7 +407,7 @@ def fetch_iadb_observations(node_id: str) -> None:
 
         cat = categories[cursor]
         try:
-            codes = _series_codes_for_category(cat)
+            codes = _series_codes_for_category(cat, deadline=deadline)
         except httpx.HTTPStatusError as exc:
             # Permanent HTTP error on one category: log, skip, keep going.
             print(f"[iadb] category {cursor} HTTP {exc.response.status_code} "
@@ -348,7 +415,11 @@ def fetch_iadb_observations(node_id: str) -> None:
             codes = []
 
         new_codes = [c for c in codes if c not in seen]
+        budget_hit = False
         for j, chunk in enumerate(_chunks(new_codes, SERIES_PER_REQUEST)):
+            if time.monotonic() > deadline:
+                budget_hit = True
+                break
             cols = _fetch_observations(chunk)
             if not cols or not cols["series_code"]:
                 if cols is None:
@@ -359,6 +430,14 @@ def fetch_iadb_observations(node_id: str) -> None:
             save_raw_parquet(table, f"{node_id}-{cursor:05d}-{j:02d}")  # raw first
             rows_this_run += table.num_rows
             batches_this_run += 1
+
+        # Budget hit mid-category: do NOT advance the cursor or mark this
+        # category's series seen — otherwise the un-fetched chunks would be
+        # skipped until the next full cycle. Leave the cursor put so the next
+        # run resumes this exact category; already-saved chunks overwrite
+        # idempotently by filename. The outer loop's deadline check ends the run.
+        if budget_hit:
+            break
 
         seen.update(codes)
         cursor += 1

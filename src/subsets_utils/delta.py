@@ -6,7 +6,6 @@ No hidden defaults. No escape hatches.
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Union
 import pyarrow as pa
 from deltalake import write_deltalake, DeltaTable, CommitProperties
@@ -18,8 +17,8 @@ except ImportError:
     except ImportError:
         TableNotFoundError = None  # fallback: we'll handle by exception type name
 
-from .config import get_data_dir, is_cloud, get_storage_options, subsets_uri
-from . import debug
+from .config import subsets_uri
+from .storage import backend
 from .tracking import record_write
 
 
@@ -71,18 +70,6 @@ class WriteResult:
     rows: int
 
 
-def _get_uri(name: str) -> str:
-    """Get Delta table URI based on environment."""
-    if is_cloud():
-        return subsets_uri(name)
-    return str(Path(get_data_dir()) / "subsets" / name)
-
-
-def _get_opts() -> dict | None:
-    """Get storage options for cloud, None for local."""
-    return get_storage_options() if is_cloud() else None
-
-
 def _target_row_count(dt: DeltaTable) -> int:
     """Sum num_records from the Delta log's add actions.
 
@@ -99,19 +86,11 @@ def _target_row_count(dt: DeltaTable) -> int:
 
 
 def _log_write_meta(name: str, schema: pa.Schema, row_count: int, mode: str):
-    """Schema-only write log for streamed sources — no nbytes or null counts."""
+    """Print a one-line schema summary for a write. Materialization lineage is
+    captured by record_write() into the run record (→ run.json), not here."""
     cols = ', '.join(f.name for f in schema)
     rows_str = f"{row_count:,}" if row_count >= 0 else "?"
     print(f"[{mode}] {name}: {rows_str} rows, {len(schema)} cols ({cols})")
-    debug.log_data_output(
-        dataset_name=name,
-        row_count=row_count if row_count >= 0 else 0,
-        size_bytes=0,
-        columns=[f.name for f in schema],
-        column_count=len(schema),
-        null_counts={},
-        mode=mode,
-    )
 
 
 def _source_hash(source, schema: pa.Schema, target_row_count: int) -> str:
@@ -232,8 +211,8 @@ def merge(
     schema = source.schema
     column_names = [f.name for f in schema]
 
-    uri = _get_uri(name)
-    opts = _get_opts()
+    uri = subsets_uri(name)
+    opts = backend.deltalake_options(uri)
 
     # Probe for table existence. If it doesn't exist yet, create it via
     # write_deltalake. Any OTHER exception must propagate — we must NOT
@@ -319,8 +298,8 @@ def overwrite(
 
     schema = source.schema
 
-    uri = _get_uri(name)
-    opts = _get_opts()
+    uri = subsets_uri(name)
+    opts = backend.deltalake_options(uri)
 
     write_deltalake(
         uri,
@@ -373,8 +352,8 @@ def append(
 
     schema = source.schema
 
-    uri = _get_uri(name)
-    opts = _get_opts()
+    uri = subsets_uri(name)
+    opts = backend.deltalake_options(uri)
 
     write_deltalake(
         uri,

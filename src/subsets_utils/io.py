@@ -5,11 +5,9 @@ is routed through fsspec via `get_fs(uri)` — local paths use the local
 filesystem, `s3://` URIs use s3fs. The primitives below are a thin
 shell over fsspec; callers see a uniform byte-level API.
 
-Today `raw_uri()` / `state_uri()` still return local paths in cloud
-(the runner bookend hydrates/flushes from R2). When that bookend is
-removed, those URIs will return `s3://` and io.py will start streaming
-writes directly to R2 via s3fs multipart upload — no changes here
-required.
+In cloud, `raw_uri()` / `state_uri()` return `s3://` URIs directly, so
+io.py streams reads/writes straight to R2 via s3fs multipart upload —
+there is no hydrate/flush bookend. In local mode they return local paths.
 
 Streaming: for datasets that don't fit in memory use `raw_writer()`
 (generic byte stream) or `raw_parquet_writer()` (row-group streaming
@@ -31,32 +29,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from deltalake import DeltaTable
 
-from . import debug
-from .config import (
-    is_cloud, get_data_dir, get_storage_options, get_bucket_name,
-    get_fs, get_fsspec_storage_options,
-    raw_uri, state_uri, subsets_uri,
-    mirror_raw_path, mirror_state_path,
-)
-
-
-# =============================================================================
-# Mirror fallback — dev mode reads from SSD mirror when local dev file missing
-# =============================================================================
-
-def _read_with_mirror_fallback(uri: str, mirror: Path | None) -> Optional[bytes]:
-    """Read a URI, falling back to the SSD mirror path if local read misses.
-
-    Only applies in local (dev) mode: s3:// URIs go straight through, and
-    writes never touch the mirror. This is the single read-time hook that
-    makes dev iterate without re-downloading data already in R2.
-    """
-    data = _read_bytes(uri)
-    if data is not None:
-        return data
-    if uri.startswith("s3://") or mirror is None:
-        return None
-    return mirror.read_bytes() if mirror.exists() else None
+from . import tracking
+from .config import get_fs, raw_uri, state_uri, subsets_uri
+from .storage import backend
 
 
 # =============================================================================
@@ -64,32 +39,23 @@ def _read_with_mirror_fallback(uri: str, mirror: Path | None) -> Optional[bytes]
 # =============================================================================
 
 def _write_bytes(uri: str, data: bytes) -> None:
-    """Write bytes to a URI (s3:// or local path) via fsspec."""
-    fs = get_fs(uri)
-    with fs.open(uri, "wb") as f:
-        f.write(data)
+    """Write bytes to a URI (s3:// or local path). Delegates to StorageBackend."""
+    backend.write_bytes(uri, data)
 
 
 def _read_bytes(uri: str) -> Optional[bytes]:
-    """Read bytes from a URI via fsspec. Returns None if not found."""
-    fs = get_fs(uri)
-    try:
-        with fs.open(uri, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
+    """Read bytes from a URI. Returns None if not found. Delegates to StorageBackend."""
+    return backend.read_bytes(uri)
 
 
 def _exists(uri: str) -> bool:
-    """Check if a URI exists."""
-    return get_fs(uri).exists(uri)
+    """Check if a URI exists. Delegates to StorageBackend."""
+    return backend.exists(uri)
 
 
 def _delete(uri: str) -> None:
-    """Delete a URI. No-op if already absent."""
-    fs = get_fs(uri)
-    if fs.exists(uri):
-        fs.rm(uri)
+    """Delete a URI. No-op if already absent. Delegates to StorageBackend."""
+    backend.delete(uri)
 
 
 # =============================================================================
@@ -104,35 +70,6 @@ def data_hash(table: pa.Table) -> str:
     return h.hexdigest()[:16]
 
 
-def raw_parquet_hash(asset_id: str) -> str | None:
-    """Hash a raw parquet by footer metadata only — no data scan.
-
-    Reads the parquet footer (rowcount + Arrow schema) via fsspec and returns
-    a hash equivalent to data_hash(load_raw_parquet(asset_id)) without loading
-    the data. Returns None if the file doesn't exist.
-
-    Use in transform nodes to short-circuit before loading GBs into memory
-    when the raw file hasn't changed since last run.
-    """
-    uri = raw_uri(asset_id, "parquet")
-    fs = get_fs(uri)
-
-    def _hash_from(pf: pq.ParquetFile) -> str:
-        h = hashlib.md5()
-        h.update(f"{pf.metadata.num_rows}".encode())
-        h.update(str(pf.schema_arrow).encode())
-        return h.hexdigest()[:16]
-
-    try:
-        with fs.open(uri, "rb") as f:
-            return _hash_from(pq.ParquetFile(f))
-    except FileNotFoundError:
-        mirror = mirror_raw_path(asset_id, "parquet")
-        if mirror is None or not mirror.exists():
-            return None
-        return _hash_from(pq.ParquetFile(str(mirror)))
-
-
 # =============================================================================
 # Subsets (published Delta tables)
 # =============================================================================
@@ -141,7 +78,7 @@ def load_asset(asset_name: str) -> pa.Table:
     """Load a published Delta table by name."""
     from .tracking import record_read
     uri = subsets_uri(asset_name)
-    opts = get_storage_options() if uri.startswith("s3://") else None
+    opts = backend.deltalake_options(uri)
     try:
         table = DeltaTable(uri, storage_options=opts).to_pyarrow_table()
     except Exception as e:
@@ -158,7 +95,7 @@ def _load_state_raw(asset: str) -> dict:
     """Load state including underscore-prefixed reserved keys (e.g. _metadata).
     Internal: used by record_completion and save_state's merge path."""
     uri = state_uri(asset)
-    data = _read_with_mirror_fallback(uri, mirror_state_path(asset))
+    data = _read_bytes(uri)
     if not data:
         return {}
     return json.loads(data.decode("utf-8"))
@@ -212,7 +149,7 @@ def save_state(asset: str, state_data: dict) -> str:
     }
     uri = state_uri(asset)
     _write_bytes(uri, json.dumps(payload, indent=2).encode("utf-8"))
-    debug.log_state_change(asset, existing, payload)
+    tracking.record_state_change(asset, existing, payload)
     return uri
 
 
@@ -243,7 +180,7 @@ def record_completion(asset: str, code_hash: str | None) -> str:
     }
     uri = state_uri(asset)
     _write_bytes(uri, json.dumps(payload, indent=2).encode("utf-8"))
-    debug.log_state_change(asset, existing, payload)
+    tracking.record_state_change(asset, existing, payload)
     return uri
 
 
@@ -282,7 +219,7 @@ def load_raw_file(asset_id: str, extension: str = "txt", *, binary: bool = False
     """
     from .tracking import record_read
     uri = raw_uri(asset_id, extension, entity_id=entity_id)
-    data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, extension))
+    data = _read_bytes(uri)
     if data is None:
         raise FileNotFoundError(f"Raw asset '{asset_id}.{extension}' not found at {uri}")
     record_read(f"raw/{(entity_id + '/') if entity_id else ''}{asset_id}.{extension}")
@@ -327,7 +264,7 @@ def load_raw_json(asset_id: str, *, entity_id: str | None = None):
     from .tracking import record_read
     for ext in ("json", "json.gz"):
         uri = raw_uri(asset_id, ext, entity_id=entity_id)
-        data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, ext))
+        data = _read_bytes(uri)
         if data is None:
             continue
         record_read(f"raw/{(entity_id + '/') if entity_id else ''}{asset_id}.{ext}")
@@ -395,7 +332,7 @@ def load_raw_ndjson(asset_id: str) -> list[dict]:
     from .tracking import record_read
     for compression, ext in (("zstd", "ndjson.zst"), ("gzip", "ndjson.gz"), (None, "ndjson")):
         uri = raw_uri(asset_id, ext)
-        data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, ext))
+        data = _read_bytes(uri)
         if data is None:
             continue
         record_read(f"raw/{asset_id}.{ext}")
@@ -438,7 +375,7 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
     """Load a Parquet file as PyArrow table."""
     from .tracking import record_read
     uri = raw_uri(asset_id, "parquet")
-    data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, "parquet"))
+    data = _read_bytes(uri)
     if data is None:
         raise FileNotFoundError(f"Raw parquet '{asset_id}' not found at {uri}")
     record_read(f"raw/{asset_id}.parquet")
@@ -449,8 +386,7 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
 def raw_parquet_localpath(asset_id: str):
     """Context manager yielding a local filesystem path to a raw parquet.
 
-    In dev mode: yields the dev path directly (or SSD mirror fallback) —
-    no copy.
+    In dev mode: yields the dev path directly — no copy.
     In cloud mode: streams the remote parquet to a tempfile and yields
     that path; the file is deleted on exit.
 
@@ -471,10 +407,6 @@ def raw_parquet_localpath(asset_id: str):
         local = Path(uri)
         if local.exists():
             yield str(local)
-            return
-        mirror = mirror_raw_path(asset_id, "parquet")
-        if mirror and mirror.exists():
-            yield str(mirror)
             return
         raise FileNotFoundError(f"Raw parquet '{asset_id}' not found at {uri}")
 
@@ -555,29 +487,17 @@ def raw_reader(
     compression: str | None = None,
     encoding: str | None = "utf-8",
 ):
-    """Streaming reader for a raw asset. Symmetric with raw_writer().
-
-    Honors the SSD mirror fallback in dev mode: if the asset is missing
-    from the local dev dir but present in the mirror, it reads from the
-    mirror path transparently.
-    """
+    """Streaming reader for a raw asset. Symmetric with raw_writer()."""
     from .tracking import record_read
     uri = raw_uri(asset_id, extension)
 
-    # Dev mode mirror fallback
-    target = uri
-    if not uri.startswith("s3://") and not Path(uri).exists():
-        mirror = mirror_raw_path(asset_id, extension)
-        if mirror is not None and mirror.exists():
-            target = str(mirror)
-
-    fs = get_fs(target)
+    fs = get_fs(uri)
     open_kwargs = {}
     if "t" in mode:
         open_kwargs["encoding"] = encoding
     if compression is not None:
         open_kwargs["compression"] = compression
-    with fs.open(target, mode=mode, **open_kwargs) as f:
+    with fs.open(uri, mode=mode, **open_kwargs) as f:
         yield f
     record_read(f"raw/{asset_id}.{extension}")
 
@@ -650,10 +570,7 @@ def list_raw_files(pattern: str) -> list[str]:
 def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | None = None, *, entity_id: str | None = None) -> bool:
     """Check if a raw asset exists. Optionally check it is fresh enough.
 
-    Works for both s3:// URIs (via fsspec `fs.info`) and local paths. In
-    dev mode, falls back to the SSD mirror if the local dev file is
-    missing — so `download-if-missing` nodes don't re-fetch data already
-    present in the mirror.
+    Works for both s3:// URIs (via fsspec `fs.info`) and local paths.
 
     Args:
         max_age_days: If set, returns False if the asset is older than this many days.
@@ -681,16 +598,11 @@ def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | No
             now = datetime.now()
         return (now - mtime) < timedelta(days=max_age_days)
 
-    # Local dev: check local dev dir, then SSD mirror.
-    def _check_local(p: Path) -> bool:
-        if not p.exists():
-            return False
-        if max_age_days is not None:
-            age = datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)
-            return age < timedelta(days=max_age_days)
-        return True
-
-    if _check_local(Path(uri)):
-        return True
-    mirror = mirror_raw_path(asset_id, ext)
-    return mirror is not None and _check_local(mirror)
+    # Local dev: check local dev dir.
+    p = Path(uri)
+    if not p.exists():
+        return False
+    if max_age_days is not None:
+        age = datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)
+        return age < timedelta(days=max_age_days)
+    return True

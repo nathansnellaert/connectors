@@ -28,66 +28,23 @@ def get_connector_name() -> str:
 # =============================================================================
 
 def get_data_dir() -> str:
-    """Root directory for this connector's raw + state files.
+    """Root directory for this connector's raw + state files in LOCAL mode.
 
     Defaults to `data/dev/` relative to cwd (override with DATA_DIR env
-    var). Symmetric in local and cloud — in cloud, cwd is the GitHub
-    Actions workspace, so this resolves to an ephemeral directory
-    inside the checkout.
+    var). In local mode this is where raw + state files live; connectors
+    use filesystem primitives freely (Path, glob, gzip.open, etc.).
 
-    Persistence: the subsets runner bookends each cloud invocation by
-    hydrating `<connector>/data/{raw,state}/*` from R2 before the
-    subprocess starts and flushing local changes back to R2 after it
-    exits (see meta/subsets_utils/runner.py). From a connector's
-    perspective, `get_data_dir()` is just "a directory with your
-    persistent raw + state files" in both modes — use filesystem
-    primitives freely (Path, glob, gzip.open, etc.).
+    In cloud mode raw + state do NOT live here: `raw_uri()` / `state_uri()`
+    return `s3://` URIs directly and io.py streams reads/writes straight to
+    R2 via fsspec/s3fs — there is no hydrate/flush bookend. `get_data_dir()`
+    is then only an ephemeral local scratch directory inside the GitHub
+    Actions checkout (the runner ensures it exists for any incidental
+    local writes).
 
     Subset Delta tables live at `s3://` in cloud regardless — deltalake
     manages its own storage layer (see `subsets_uri`).
     """
     return os.environ.get('DATA_DIR', 'data/dev')
-
-
-# =============================================================================
-# Dev read-fallback — read-only directory consulted when a raw/state file
-# isn't in the local dev dir yet.
-#
-# Purely a local-dev convenience: lets dev runs reuse data already fetched
-# elsewhere (e.g. an external reflection of prod state) without re-downloading.
-# OPT-IN and dev-only — disabled unless SUBSETS_MIRROR_ROOT points at an
-# existing directory; never consulted in cloud or for writes. The library
-# carries no machine-specific default path; the location is entirely the
-# operator's to supply via the env var.
-# =============================================================================
-
-def get_mirror_root() -> Path | None:
-    """Root of the read-only dev fallback, or None when unset/missing.
-
-    Set SUBSETS_MIRROR_ROOT to enable. Returns None if the var is unset or the
-    path doesn't exist — callers skip the fallback in that case.
-    """
-    root = os.environ.get('SUBSETS_MIRROR_ROOT')
-    if not root:
-        return None
-    p = Path(root)
-    return p if p.exists() else None
-
-
-def mirror_raw_path(asset_id: str, ext: str = "parquet") -> Path | None:
-    """Path to a raw asset in the dev fallback. None if fallback unavailable."""
-    root = get_mirror_root()
-    if root is None:
-        return None
-    return root / get_connector_name() / "data" / "raw" / f"{asset_id}.{ext}"
-
-
-def mirror_state_path(asset: str) -> Path | None:
-    """Path to a state file in the dev fallback. None if fallback unavailable."""
-    root = get_mirror_root()
-    if root is None:
-        return None
-    return root / get_connector_name() / "data" / "state" / f"{asset}.json"
 
 
 # =============================================================================
@@ -119,16 +76,13 @@ def validate_environment(additional_required: list[str] = None):
 # =============================================================================
 
 def get_storage_options() -> dict | None:
-    """Get storage options for DeltaLake S3 writes. Returns None for local mode."""
-    if not is_cloud():
-        return None
-    return {
-        'AWS_ENDPOINT_URL': f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        'AWS_ACCESS_KEY_ID': os.environ['R2_ACCESS_KEY_ID'],
-        'AWS_SECRET_ACCESS_KEY': os.environ['R2_SECRET_ACCESS_KEY'],
-        'AWS_REGION': 'auto',
-        'AWS_S3_ALLOW_UNSAFE_RENAME': 'true',
-    }
+    """Get storage options for DeltaLake S3 writes. Returns None for local mode.
+
+    Thin shim over StorageBackend.deltalake_options() — kept for callers that
+    don't have a URI in hand.
+    """
+    from .storage import backend
+    return backend.deltalake_options()
 
 
 def get_bucket_name() -> str:
@@ -144,44 +98,28 @@ def get_bucket_name() -> str:
 # s3fs filesystem pointed at R2. Connectors never see the difference —
 # they call save_raw_*/load_raw_*/raw_writer, which route through here.
 #
-# Today raw_uri() / state_uri() still return local paths in cloud (the
-# runner bookend hydrates/flushes from R2). When the bookend is removed,
-# those URIs will flip to s3:// and the same io.py code will stream
-# writes directly to R2 via s3fs multipart upload — no code changes in
-# io.py required.
+# In cloud, raw_uri() / state_uri() return s3:// URIs directly, so io.py
+# streams writes straight to R2 via s3fs multipart upload — there is no
+# hydrate/flush bookend. In local mode they return local paths.
 # =============================================================================
 
 def get_fsspec_storage_options(uri: str) -> dict:
-    """fsspec storage_options for a URI. Empty for local, R2 creds for s3://."""
-    if not uri.startswith("s3://"):
-        return {}
-    return {
-        "endpoint_url": f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        "key": os.environ["R2_ACCESS_KEY_ID"],
-        "secret": os.environ["R2_SECRET_ACCESS_KEY"],
-        "client_kwargs": {"region_name": "auto"},
-    }
+    """fsspec storage_options for a URI. Empty for local, R2 creds for s3://.
+
+    Thin shim over StorageBackend.fsspec_storage_options().
+    """
+    from .storage import backend
+    return backend.fsspec_storage_options(uri)
 
 
 def get_fs(uri: str = ""):
     """fsspec filesystem for a URI. Protocol-dispatched, cached by fsspec.
 
-    For s3:// URIs returns s3fs pointed at R2 (requires `s3fs` installed).
-    For everything else returns the local filesystem with auto_mkdir so
-    parent dirs are created transparently on open.
+    Thin shim over StorageBackend.fsspec_fs(); see there for the R2
+    fixed_upload_size quirk.
     """
-    import fsspec
-    if uri.startswith("s3://"):
-        # Cloudflare R2 rejects a multipart upload whose non-final parts differ
-        # in size ("All non-trailing parts must have the same length"). s3fs only
-        # emits uniform parts when constructed with fixed_upload_size=True, so any
-        # multipart-sized write streamed straight to R2 (e.g. a large parquet from
-        # raw_parquet_writer) needs it. Passed as a constructor kwarg so it lands
-        # in fsspec's instance-cache key and is set correctly at build time.
-        return fsspec.filesystem(
-            "s3", fixed_upload_size=True, **get_fsspec_storage_options("s3://")
-        )
-    return fsspec.filesystem("file", auto_mkdir=True)
+    from .storage import backend
+    return backend.fsspec_fs(uri)
 
 
 # =============================================================================
@@ -203,22 +141,54 @@ def get_r2_prefix() -> str:
 
 
 def get_r2_base() -> str:
-    """Get R2 base path for current connector: [<prefix>/]<connector>/data"""
+    """Get R2 base path for current connector: [<prefix>/]<connector>/data
+
+    Durable, run-independent data lives here: state files (cursors that must
+    survive across runs) and subset Delta tables (Delta is itself the versioned
+    artifact). Raw does NOT — see get_r2_run_base().
+    """
     prefix = get_r2_prefix()
     base = f"{get_connector_name()}/data"
+    return f"{prefix}/{base}" if prefix else base
+
+
+def get_r2_run_base() -> str:
+    """Get R2 base for THIS run's artifacts: [<prefix>/]<connector>/runs/<run_id>
+
+    Raw assets are colocated here (next to run.json/logs/memory) so each run is
+    a self-contained, versioned snapshot — runs no longer overwrite each other
+    in place. Mirrors runtime.run_dir(slug, run_id) on the reader side so the
+    keys raw_uri() writes string-match what bucket_state() lists.
+
+    RUN_ID is set by the runner for the whole execution; a missing one in cloud
+    is a programming error (raw would otherwise silently land at runs/unknown).
+    """
+    run_id = os.environ.get("RUN_ID")
+    if not run_id:
+        raise RuntimeError(
+            "RUN_ID not set — cannot build a run-scoped raw URI in cloud mode"
+        )
+    prefix = get_r2_prefix()
+    base = f"{get_connector_name()}/runs/{run_id}"
     return f"{prefix}/{base}" if prefix else base
 
 
 def raw_uri(asset_id: str, ext: str = "parquet", *, entity_id: str | None = None) -> str:
     """URI for a raw asset. s3:// in cloud, local path in dev.
 
+    In cloud, raw is run-scoped: <connector>/runs/<run_id>/raw/... (see
+    get_r2_run_base) so each run keeps its own versioned snapshot. Reads and
+    writes both route through here, so within a single execution (one RUN_ID)
+    they resolve to the same run automatically — no manifest needed.
+
     When entity_id is given, namespaces the path under <entity_id>/. This is
     the meta entity-prefix layout; legacy callers (data-integrations
-    connectors) pass entity_id=None and get the flat path."""
+    connectors) pass entity_id=None and get the flat path.
+
+    Local mode stays flat (data/dev/raw/...) — see raw_path."""
     if is_cloud():
-        if entity_id is not None:
-            return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{entity_id}/{asset_id}.{ext}"
-        return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{asset_id}.{ext}"
+        sub = f"{entity_id}/{asset_id}" if entity_id is not None else asset_id
+        return f"s3://{get_bucket_name()}/{get_r2_run_base()}/raw/{sub}.{ext}"
     return raw_path(asset_id, ext, entity_id=entity_id)
 
 
