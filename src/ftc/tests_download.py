@@ -1,21 +1,22 @@
 """Post-DAG health invariants for the FTC download step.
 
-Two entities with different raw layouts:
-  - ftc-hsr-early-termination-notices : ONE ndjson asset (stateless full re-pull).
-  - ftc-dnc-complaints                : a firehose written as seq-range BATCH
-    files `ftc-dnc-complaints-<lo>-<hi>.ndjson.zst`; the bare spec id is a prefix,
-    not a file. One run writes a bounded slice (possibly partial), so we assert
-    structure + non-emptiness rather than a full-corpus count.
+Both entities write ONE ndjson asset (stateless overwrite):
+  - ftc-hsr-early-termination-notices : full re-pull (bounded to a few pages when
+    only DEMO_KEY is available; full corpus with a registered FTC_API_KEY).
+  - ftc-dnc-complaints                : bounded recent window of complaints.
+
+The per-run row count varies with the available api.data.gov key (a handful of
+pages on DEMO_KEY vs. thousands with a registered key), so we assert structure +
+non-emptiness rather than a full-corpus count. An empty or shapeless payload
+means the JSON:API envelope changed or auth/pagination broke silently.
 """
-from subsets_utils import load_raw_ndjson, list_raw_files
+from subsets_utils import load_raw_ndjson
 
 HSR_ID = "ftc-hsr-early-termination-notices"
-DNC_PREFIX = "ftc-dnc-complaints-"
+DNC_ID = "ftc-dnc-complaints"
 
 
 def test_hsr_nonempty_and_structured():
-    """HSR is a small full snapshot; an empty or shapeless payload means the
-    JSON:API envelope changed or auth/pagination broke silently."""
     rows = load_raw_ndjson(HSR_ID)
     assert len(rows) > 0, f"{HSR_ID}: raw ndjson has 0 rows"
     r = rows[0]
@@ -25,18 +26,21 @@ def test_hsr_nonempty_and_structured():
     assert all(row.get("id") for row in rows), f"{HSR_ID}: some rows have empty id"
 
 
-def test_dnc_batches_nonempty_and_structured():
-    """DNC firehose must have produced at least one non-empty batch file with the
-    seq cursor field intact — empty batches mean the offset/seq cursor broke."""
-    files = list_raw_files(f"{DNC_PREFIX}*.ndjson.zst")
-    assert files, "no ftc-dnc-complaints-*.ndjson.zst batch files were written"
-    seen = 0
-    for f in files:
-        asset_id = f[: -len(".ndjson.zst")]
-        rows = load_raw_ndjson(asset_id)
-        assert len(rows) > 0, f"{f}: batch has 0 rows"
-        r = rows[0]
-        assert "id" in r and r.get("id"), f"{f}: record missing id"
-        assert isinstance(r.get("seq"), int), f"{f}: 'seq' is not an int (got {r.get('seq')!r})"
-        seen += len(rows)
-    assert seen > 0, "DNC batches present but collectively empty"
+def test_dnc_nonempty_and_structured():
+    rows = load_raw_ndjson(DNC_ID)
+    assert len(rows) > 0, f"{DNC_ID}: raw ndjson has 0 rows"
+    r = rows[0]
+    for col in ("id", "seq", "created-date"):
+        assert col in r, f"{DNC_ID}: record missing '{col}' (got {sorted(r)[:12]})"
+    assert all(row.get("id") for row in rows), f"{DNC_ID}: some rows have empty id"
+    # seq is the monotonic complaint cursor; it must be an int on every row.
+    assert all(isinstance(row.get("seq"), int) for row in rows), \
+        f"{DNC_ID}: some rows have non-int 'seq'"
+
+
+def test_dnc_ids_unique():
+    """The recent-window fetch dedupes by id in-memory; duplicates would mean the
+    dedupe broke and transform's id-merge would behave unexpectedly."""
+    rows = load_raw_ndjson(DNC_ID)
+    ids = [row.get("id") for row in rows]
+    assert len(ids) == len(set(ids)), f"{DNC_ID}: duplicate ids in raw payload"

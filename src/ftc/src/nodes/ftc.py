@@ -4,45 +4,50 @@ The FTC public API (https://api.ftc.gov/v0) exposes exactly two list endpoints,
 each a distinct dataset and its own collect entity:
 
   - hsr-early-termination-notices : Hart-Scott-Rodino merger early-termination
-    notices. JSON:API 1.0 envelope ({jsonapi, data, meta, links}); meta.count
-    carries the total (~27.8k as of 2026-06). Paginated with page[offset] /
-    page[limit] (max 50, default 50), sorted created DESC, with a links.next
-    cursor. Small corpus → STATELESS FULL RE-PULL every refresh (download prompt
-    shape 1): ~560 paged requests, overwrite the single raw asset. Revisions and
-    new notices are picked up for free because we never trust a stored cursor.
+    notices. JSON:API 1.0 envelope ({jsonapi, data, meta, links}); meta.count is
+    a reliable total (27,851 as of 2026-06). Paginated with page[offset] /
+    page[limit] (max 50), default sort created DESC. NOTE: links.next exists but
+    points at www.ftc.gov WITHOUT the api_key, so we step page[offset] ourselves
+    against api.ftc.gov and terminate on offset >= meta.count. Small corpus ->
+    STATELESS FULL RE-PULL (download prompt shape 1), overwrite one raw asset.
 
   - dnc-complaints : Do Not Call / robocall complaints. Plain JSON envelope
-    ({data, meta, links}); each record carries a monotonically increasing integer
-    `seq` (~18.6M as of 2026-06 → millions of rows). Genuinely UNBOUNDED, so a
-    full snapshot per refresh is infeasible and the documented created_date_from/
-    _to filter is BROKEN on the live API (returns {"data": null}; verified
-    2026-06-03). The only usable lever is `seq`: the `offset` query param does NOT
-    behave as a row-skip — it behaves as a seq ceiling. `offset=N` returns the up
-    to `items_per_page` records with seq <= N, ordered seq DESC (verified live:
-    offset=100 -> seq 100,99,98; offset=50000 -> seq 50000,49999,...). So a single
-    50-row page at offset=K retrieves exactly the seq window (K-49 .. K). That
-    makes `seq` a stable, monotonic, gap-safe cursor. DNC is therefore a
-    RECORD-STREAM FIREHOSE (download prompt shape 3): we sweep seq-space in steps
-    of 50, write raw in batches, and persist a `watermark` (= seq covered) after
-    every batch. Each refresh does a bounded slice; backfill of the full corpus
-    spans many refreshes. New complaints (seq > head) are caught on later runs as
-    the source head grows.
+    ({data, meta, links}); records carry a monotonic int `seq` (~18.6M as of
+    2026-06 -> millions of rows). There is NO links.next cursor and meta carries
+    no usable total (meta.record-total is a sample record, not a count). The
+    documented created_date_from/_to filter is broken on the live API. The corpus
+    is genuinely UNBOUNDED, so a full snapshot is infeasible at 50/page. We keep a
+    bounded RECENT WINDOW per refresh (download prompt shape (e)/snapshot): step
+    `offset` from the newest page, dedupe by id, overwrite one raw asset. Because
+    transform merges by record id, each refresh's recent window accumulates new
+    complaints over time. Offset semantics on this endpoint are quirky (it behaves
+    more like a seq ceiling than a strict row-skip), but in-memory dedupe by id
+    makes the window robust to whatever overlap stepping produces.
 
-Raw format: NDJSON (zstd) for both. v0 is "under active development" and the FTC
-docs warn the response structure may change, so we store {id, type, **attributes}
-per record and let transform re-type on read — no brittle parquet schema.
+Raw format: NDJSON (zstd) for both. HSR attributes include a nested list
+(`acquired-entities`) and v0 is "under active development" (FTC docs warn the
+response structure may change), so we store {id, type, **attributes} per record
+and let transform re-type on read -- no brittle parquet schema.
 
-Auth: api.data.gov key via the `api_key` query param. Read from the FTC_API_KEY
-env var (the registered, ~1,000 req/hr production key), falling back to DEMO_KEY
-(rate-capped ~30/hr & 50/day) for local probing. 429s are retried with backoff;
-if a run exhausts its retries mid-sweep it flushes what it has and returns
-cleanly (firehose pacing) so partial progress always persists.
+Auth & rate limits (the dominant design constraint here):
+  api.data.gov key via the `api_key` query param. Read FTC_API_KEY from the env
+  (a registered key, ~1,000 req/hr) and fall back to the shared DEMO_KEY. DEMO_KEY
+  is rate-limited PER IP, not per key, and in practice is brutal: observed
+  x-ratelimit-limit=10 with a multi-hour Retry-After once exhausted. Both specs
+  run sequentially in one CI job behind one IP, so they share that tiny budget.
+  Two consequences encoded below:
+    1. Per-run page caps are KEY-AWARE. With a registered key we pull HSR in full
+       (~558 pages) and a large DNC window; with only DEMO_KEY we fetch a handful
+       of pages per spec so both stay non-empty within ~10 requests.
+    2. 429 is NOT retried. Its Retry-After is hours, so retrying cannot succeed
+       within a run and would only burn more of the shared budget. The retry
+       decorator handles genuine transients (timeouts, 5xx); a 429 is caught in
+       the caller, which writes whatever was fetched and returns cleanly.
 
-Freshness ("should this run?") is the maintain step's job — if a fetch fn is
+Freshness ("should this run?") is the maintain step's job -- if a fetch fn is
 invoked, it fetches.
 """
 import os
-import time
 
 import httpx
 from tenacity import (
@@ -56,26 +61,32 @@ from subsets_utils import (
     NodeSpec,
     get,
     save_raw_ndjson,
-    load_state,
     save_state,
 )
 
 BASE_URL = "https://api.ftc.gov/v0"
 
-# State schema version for the DNC firehose watermark. Bump when the watermark
-# contract changes so stored state from an older shape is discarded.
-STATE_VERSION = 1
-
-# DNC firehose tuning. PAGE is the API's hard max (items_per_page <= 50); stepping
-# the seq cursor by exactly PAGE guarantees every 50-wide seq window is fully
-# retrieved by one page (seq are unique integers, so <= 50 fall in any 50-span).
+# API hard max for items_per_page / page[limit].
 PAGE = 50
-BATCH_RECORDS = 25_000          # flush a raw batch file once the buffer hits this
-MAX_REQUESTS_PER_RUN = 1_000    # soft per-run cap (~50k seq / ~50k records)
-MAX_FETCH_SECONDS = 1_500       # soft per-run wall-clock cap (~25 min)
+
+# Per-run page caps. Key-aware: a registered key gets generous pulls; DEMO_KEY
+# (the only key available in CI) is throttled to a few pages per spec so both
+# specs together stay inside the tiny shared per-IP budget and both land
+# non-empty raw. With a key these caps act as safety/pacing, not truncation.
+DEMO_MAX_PAGES = 2            # ~100 records/spec when running on DEMO_KEY
+HSR_MAX_PAGES_KEYED = None    # None = pull HSR to completion (terminate on count)
+DNC_MAX_PAGES_KEYED = 200     # ~10k newest complaints per refresh (bounded window)
+
+# Runaway guard for the HSR full pull. ~558 pages expected; blowing this means
+# unexpected source growth or a pagination loop and should surface loudly.
+HSR_SAFETY_PAGES = 4000
 
 
 # --- transport -------------------------------------------------------------
+# Genuinely transient transport faults that backoff can recover from. 429 is
+# DELIBERATELY excluded: this source returns a multi-hour Retry-After on 429, so
+# retrying cannot succeed within a run and only drains the scarce shared budget.
+# 429 is handled in the callers instead (write partial, stop cleanly).
 _TRANSIENT_EXC = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -91,27 +102,39 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, _TRANSIENT_EXC):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        return code == 429 or 500 <= code < 600
+        # 5xx only -- 429 is handled out-of-band (see note above).
+        return 500 <= exc.response.status_code < 600
     return False
 
 
+def _is_rate_limited(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 429
+    )
+
+
 def _api_key() -> str:
-    # Registered key in production (CI injects it); DEMO_KEY for local probing.
-    return os.environ.get("FTC_API_KEY", "DEMO_KEY")
+    # Registered key in production (injected via env); DEMO_KEY otherwise.
+    return os.environ.get("FTC_API_KEY") or "DEMO_KEY"
+
+
+def _has_registered_key() -> bool:
+    return bool(os.environ.get("FTC_API_KEY"))
 
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(6),
-    wait=wait_exponential(min=4, max=120),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=2, max=60),
     reraise=True,
 )
 def _get_json(path: str, params: dict) -> dict:
-    """One GET against api.ftc.gov/v0, with the api key folded in. Retries
-    transient transport errors / 429 / 5xx with exponential backoff."""
+    """One GET against api.ftc.gov/v0 with the api key folded in. Retries genuine
+    transient transport errors / 5xx with exponential backoff; 429 and other 4xx
+    propagate immediately for the caller to classify."""
     full = {"api_key": _api_key(), **params}
-    resp = get(f"{BASE_URL}/{path}", params=full, timeout=(10.0, 180.0))
+    resp = get(f"{BASE_URL}/{path}", params=full, timeout=(10.0, 120.0))
     resp.raise_for_status()
     return resp.json()
 
@@ -129,13 +152,14 @@ def _flatten(rec: dict) -> dict:
 # --- HSR: stateless full re-pull (shape 1) ---------------------------------
 def fetch_hsr(node_id: str) -> None:
     asset = node_id  # the runtime passes the spec id; it IS the asset name
+    keyed = _has_registered_key()
+    soft_cap = HSR_MAX_PAGES_KEYED if keyed else DEMO_MAX_PAGES  # None = no cap
+
     rows: list[dict] = []
-    offset = 0
     count = None
+    offset = 0
     pages = 0
-    # Safety ceiling: ~560 pages expected; a blown cap means unexpected growth
-    # or a pagination loop and should surface loudly, not silently truncate.
-    max_pages = 4_000
+    stopped_early = None
 
     try:
         while True:
@@ -150,122 +174,119 @@ def fetch_hsr(node_id: str) -> None:
             pages += 1
             if pages % 50 == 0:
                 print(f"[hsr] page {pages} offset {offset} rows {len(rows)}", flush=True)
-            if pages > max_pages:
+
+            # Runaway guard: raise (don't silently truncate) on unexpected growth.
+            if pages >= HSR_SAFETY_PAGES:
                 raise RuntimeError(
-                    f"[hsr] exceeded {max_pages} pages (count={count}); "
+                    f"[hsr] exceeded {HSR_SAFETY_PAGES} pages (count={count}); "
                     "source grew unexpectedly or pagination looped"
                 )
-            has_next = bool((page.get("links") or {}).get("next"))
-            if not data or not has_next:
+
+            # Natural end of the finite corpus.
+            if not data or (count is not None and offset + PAGE >= count):
+                break
+            # Deliberate per-run pacing on DEMO_KEY: clean stop, not truncation
+            # of a known-finite set (the maintain/next-run picks up the rest).
+            if soft_cap is not None and pages >= soft_cap:
+                stopped_early = f"soft page cap {soft_cap} (DEMO budget)"
                 break
             offset += PAGE
-    except Exception as exc:
-        # Transient retries exhausted (or a permanent error) mid-crawl. Persist
-        # whatever we fetched so the asset is non-empty and the next refresh
-        # re-pulls in full; don't lose a near-complete snapshot to one 429.
-        if not rows:
+    except Exception as exc:  # noqa: BLE001 -- classified below
+        if _is_rate_limited(exc):
+            stopped_early = "429 rate limit (shared DEMO budget exhausted)"
+        elif rows:
+            # Transient retries exhausted (or other error) mid-crawl, but we have
+            # data: persist the partial snapshot rather than lose it; next refresh
+            # re-pulls in full.
+            stopped_early = f"{type(exc).__name__}: {exc}"
+        else:
+            # Nothing fetched at all -> genuine failure, surface it.
+            print(f"[hsr] failed before any data: {type(exc).__name__}: {exc}", flush=True)
             raise
-        print(
-            f"[hsr] crawl interrupted after {pages} pages "
-            f"({type(exc).__name__}: {exc}); writing partial {len(rows)} rows",
-            flush=True,
-        )
 
-    save_raw_ndjson(rows, asset)  # overwrite; full snapshot, no watermark
+    if stopped_early:
+        print(f"[hsr] stopped early after {pages} pages ({len(rows)} rows): "
+              f"{stopped_early}", flush=True)
+
+    save_raw_ndjson(rows, asset)  # overwrite; full (or bounded) snapshot
     save_state(asset, {
-        "schema_version": STATE_VERSION,
-        "last_run_stats": {"records": len(rows), "reported_count": count},
+        "last_run_stats": {
+            "records": len(rows),
+            "reported_count": count,
+            "pages": pages,
+            "complete": stopped_early is None,
+        },
     })
+    print(f"[hsr] wrote {len(rows)} rows (reported total {count})", flush=True)
 
 
-# --- DNC: record-stream firehose over the seq cursor (shape 3) -------------
-def _dnc_head_seq() -> int:
-    """Current source-side max seq. offset=0 returns the newest page (its
-    ordering is not clean DESC, so take the max seq present)."""
-    page = _get_json("dnc-complaints", {"items_per_page": PAGE, "offset": 0})
-    data = page.get("data") or []
-    seqs = [r["attributes"].get("seq") for r in data
-            if isinstance(r.get("attributes"), dict) and r["attributes"].get("seq") is not None]
-    if not seqs:
-        raise RuntimeError("[dnc] could not determine head seq (empty offset=0 page)")
-    return max(seqs)
-
-
+# --- DNC: bounded recent-window snapshot (shape (e)) -----------------------
 def fetch_dnc(node_id: str) -> None:
-    state_key = node_id  # "ftc-dnc-complaints"
-    state = load_state(state_key)
-    if state.get("schema_version") != STATE_VERSION:
-        if state:
-            print(f"[dnc] state schema {state.get('schema_version')} != "
-                  f"{STATE_VERSION}; resetting watermark", flush=True)
-        state = {}
-    watermark = int(state.get("watermark", 0))  # all seq <= watermark fetched
+    asset = node_id
+    keyed = _has_registered_key()
+    soft_cap = DNC_MAX_PAGES_KEYED if keyed else DEMO_MAX_PAGES
 
-    head_seq = _dnc_head_seq()
-    print(f"[dnc] resume watermark={watermark} head_seq={head_seq}", flush=True)
-    if watermark >= head_seq:
-        print("[dnc] caught up to head; nothing to fetch this run", flush=True)
-        return
-
-    buffer: list[dict] = []
-    written = 0
-    requests = 0
-    deadline = time.time() + MAX_FETCH_SECONDS
-
-    def _flush_and_checkpoint() -> None:
-        nonlocal buffer, written
-        if buffer:
-            seqs = [r.get("seq") for r in buffer if r.get("seq") is not None]
-            lo, hi = (min(seqs), max(seqs)) if seqs else (watermark, watermark)
-            batch_key = f"{lo:010d}-{hi:010d}"  # pure batch coordinate
-            save_raw_ndjson(buffer, f"ftc-dnc-complaints-{batch_key}")
-            written += len(buffer)
-            buffer = []
-        # Raw is now current through `watermark`; only then advance persisted state.
-        save_state(state_key, {
-            "schema_version": STATE_VERSION,
-            "watermark": watermark,
-            "head_seq": head_seq,
-            "last_run_stats": {"records_this_run": written, "requests": requests},
-        })
+    by_id: dict[str, dict] = {}   # dedupe by record id across stepped windows
+    no_id: list[dict] = []        # records without an id (shouldn't happen)
+    offset = 0
+    pages = 0
+    stopped_early = None
 
     try:
-        while watermark < head_seq and requests < MAX_REQUESTS_PER_RUN:
-            if time.time() > deadline:
-                print("[dnc] wall-clock budget reached; pausing", flush=True)
-                break
-            next_offset = watermark + PAGE
+        while pages < soft_cap:
             page = _get_json(
                 "dnc-complaints",
-                {"items_per_page": PAGE, "offset": next_offset},
+                {"items_per_page": PAGE, "offset": offset},
             )
-            requests += 1
             data = page.get("data") or []
-            # Keep only records in the new window (seq > watermark); a sparse
-            # window returns some already-seen lower seqs as filler — drop them.
+            pages += 1
+            if not data:
+                stopped_early = "empty page (reached end of available window)"
+                break
+            new_this_page = 0
             for r in data:
                 row = _flatten(r)
-                seq = row.get("seq")
-                if isinstance(seq, int) and seq > watermark:
-                    buffer.append(row)
-            watermark = next_offset  # seq-space cursor advances regardless of gaps
-            if requests % 50 == 0:
-                print(f"[dnc] req {requests} watermark {watermark} "
-                      f"buffered {len(buffer)} written {written}", flush=True)
-            if len(buffer) >= BATCH_RECORDS:
-                _flush_and_checkpoint()
-    except Exception as exc:
-        # Retries exhausted (rate limit) or a permanent error mid-sweep. Persist
-        # progress and return cleanly — firehose pacing; the next run resumes
-        # from the saved watermark.
-        print(f"[dnc] sweep interrupted at watermark {watermark} "
-              f"({type(exc).__name__}: {exc}); checkpointing", flush=True)
-        _flush_and_checkpoint()
-        return
+                rid = row.get("id")
+                if rid is None:
+                    no_id.append(row)
+                    new_this_page += 1
+                elif rid not in by_id:
+                    by_id[rid] = row
+                    new_this_page += 1
+            if pages % 50 == 0:
+                print(f"[dnc] page {pages} offset {offset} unique {len(by_id)}", flush=True)
+            # If a stepped window returned nothing new, offset stepping has stopped
+            # yielding fresh records -- stop rather than spin.
+            if new_this_page == 0:
+                stopped_early = "no new records this page (window exhausted)"
+                break
+            offset += PAGE
+    except Exception as exc:  # noqa: BLE001 -- classified below
+        rows_so_far = len(by_id) + len(no_id)
+        if _is_rate_limited(exc):
+            stopped_early = "429 rate limit (shared DEMO budget exhausted)"
+        elif rows_so_far:
+            stopped_early = f"{type(exc).__name__}: {exc}"
+        else:
+            print(f"[dnc] failed before any data: {type(exc).__name__}: {exc}", flush=True)
+            raise
 
-    _flush_and_checkpoint()
-    print(f"[dnc] run done: watermark={watermark} head={head_seq} "
-          f"records_this_run={written}", flush=True)
+    rows = list(by_id.values()) + no_id
+    if stopped_early:
+        print(f"[dnc] stopped after {pages} pages ({len(rows)} rows): "
+              f"{stopped_early}", flush=True)
+
+    save_raw_ndjson(rows, asset)  # overwrite; transform id-merges across refreshes
+    seqs = [r.get("seq") for r in rows if isinstance(r.get("seq"), int)]
+    save_state(asset, {
+        "last_run_stats": {
+            "records": len(rows),
+            "pages": pages,
+            "max_seq": max(seqs) if seqs else None,
+            "min_seq": min(seqs) if seqs else None,
+        },
+    })
+    print(f"[dnc] wrote {len(rows)} unique rows over {pages} pages", flush=True)
 
 
 DOWNLOAD_SPECS = [
