@@ -1,41 +1,53 @@
-"""FRED download — REST API v2 (https://api.stlouisfed.org/fred/v2/).
+"""FRED download — REST, mechanism rest_v2 for the bulk observations win.
 
-Mechanism: rest_v2 (chosen by research). v2 auth is an HTTP header
-``Authorization: Bearer <api_key>`` — NOT the ``?api_key=`` query param that
-v1 uses. The 32-char key comes from the FRED_API_KEY env var.
+Verified against the live API + docs at authoring time (the docs host bot-filters
+plain GETs; read via a headless browser — see dev/RECON notes). Two facts drove
+the design:
+
+  1. FRED API **v2 exposes exactly ONE endpoint**: ``fred/v2/release/observations``
+     — "get the observations for all series on a release, full history, in bulk."
+     There is NO ``/fred/v2/releases`` and NO ``/fred/v2/release/series``. v2 is a
+     bulk-observations surface, nothing else. Its auth is an HTTP header
+     ``Authorization: Bearer <key>`` and it paginates with an opaque ``next_cursor``
+     (``has_more``/``next_cursor``), NOT limit/offset.
+  2. The release catalogue and per-series metadata therefore come from the long-
+     standing **v1** endpoints (``/fred/releases``, ``/fred/release/series``), which
+     authenticate with an ``&api_key=`` query param and paginate with limit/offset.
+     The same free 32-char key works for both surfaces (FRED_API_KEY env var).
+
+This is consistent with research's handoff: v2 is the chosen mechanism *for the
+observations bulk win* (~300 release calls vs ~840k per-series calls); v1 supplies
+the enumeration v2 structurally cannot. One key, two auth styles — do not mix them.
 
 Three collect entities, three download specs:
 
-  - ``fred-releases``     — the ~300 data releases. One small asset, full pull
-                            every run (stateless; revisions picked up for free).
-  - ``fred-series``       — series metadata for every series, fetched per release
-                            via /release/series. Firehose: one NDJSON batch per
-                            release (``fred-series-<release_id>``), streamed to
-                            bound memory, soft per-run time budget, state tracks
-                            which releases are done this cycle.
-  - ``fred-observations`` — the (date, value) history for every series, fetched
-                            per release via /release/observations (v2's bulk
-                            endpoint — the whole reason v2 was chosen: ~300
-                            release calls instead of ~840k per-series calls).
-                            Same firehose shape as series.
+  - ``fred-releases``     — the ~300-release catalogue. v1 ``/fred/releases``.
+                            Tiny; stateless full pull every run (revisions free).
+  - ``fred-series``       — series metadata for every series, per release via v1
+                            ``/fred/release/series``. Firehose: one NDJSON batch
+                            per release (``fred-series-<release_id>``), soft per-run
+                            time budget, state tracks releases done this cycle.
+  - ``fred-observations`` — full (date, value) history for every series, per release
+                            via v2 ``/fred/v2/release/observations`` (the bulk
+                            endpoint). Same per-release firehose shape; cursor
+                            pagination within each release.
 
-Why per-release firehose for series/observations: the full corpus (~840k series,
+Why per-release firehose for series/observations: the corpus (~840k series and
 their full histories) is far too large to re-pull into one file each run, so each
-spec processes as many releases as fit in a time budget, writes one batch file per
-release, and resumes from a watermark next run. ``releases`` is tiny so it stays a
-plain stateless full pull.
+spec processes as many releases as fit in a wall-clock budget, writes one batch
+file per release, and resumes from a watermark (the set of completed release ids)
+next run. When every release is done the cycle resets and re-pulls from the top,
+picking up revisions for free. ``releases`` is tiny so it stays a plain full pull.
 
-Raw format: NDJSON throughout. The FRED v2 response schema could not be observed
-during authoring (every /fred/v2/* path 401s without a key, and the docs host was
-unreachable — see dev/fixtures/RECON.md), so field types are not verified here.
-NDJSON is drift-tolerant; transform re-types on read. Envelope/pagination parsing
-is deliberately defensive for the same reason. Route names below mirror the
-well-known v1 surface and are confirmed by the first keyed (cloud) run.
+Raw format: NDJSON throughout — the v2 series record carries a free-form ``notes``
+blob and optional fields, so it is drift-prone; transform re-types on read.
+Observations are flattened to one ``{series_id, date, value, release_id}`` row each
+(value is FRED's numeric *string*, "." = missing — preserved verbatim).
 
-Rate limit: 120 req/min documented. Each spec runs in its own process and they
-share the api.stlouisfed.org host, so each process is capped well under the limit
-(~32/min) to stay under 120 combined when specs run concurrently; 429s are caught
-by the retry backoff as a safety net.
+Rate limit: 120 req/min documented, enforced server-side **per API key** — so it is
+shared across the three specs (each runs in its own process against the same key).
+Each process is capped well under a third of the budget; 429s are caught by the
+retry backoff as a safety net.
 """
 import json
 import os
@@ -63,26 +75,27 @@ from subsets_utils import (
 # Bump when the persisted firehose state contract changes (keys / watermark shape).
 STATE_VERSION = 1
 
-_BASE = "https://api.stlouisfed.org/fred/v2"
+_V1_BASE = "https://api.stlouisfed.org/fred"
+_V2_BASE = "https://api.stlouisfed.org/fred/v2"
 
 # Soft per-run wall-clock budget for the firehose specs. Hitting it returns
-# cleanly with state advanced — the next run resumes. Not a hard cap.
+# cleanly with state advanced — the next run resumes. Deliberate pacing, not a cap.
 MAX_FETCH_SECONDS = 1500  # 25 min
 
-# Page sizes. v1 caps releases/series at 1000 and observations at 100000; v2 is
-# assumed similar. Pagination terminates on a short page, so an unexpectedly
-# small cap only costs extra requests, never correctness.
-_PAGE_LIMIT_SERIES = 1000
-_PAGE_LIMIT_OBS = 100000
+# v1 paginates with limit/offset. Releases/series cap at 1000 per page.
+_V1_PAGE_LIMIT = 1000
+# v2 observations: limit is observations-per-page, max 500000 (the documented
+# ceiling and default). Big pages => few requests for the huge bulk responses.
+_V2_OBS_LIMIT = 500000
 
-# Runaway guard for the pagination loop (an API that ignores limit/offset would
-# otherwise spin forever). Far above any real page count, so tripping it means
-# the source grew past expectations or the loop misbehaved — surface it loudly.
-_MAX_PAGES = 100_000
+# Runaway guard for any pagination loop (an API ignoring limit/offset or cursor
+# would otherwise spin forever). Far above any real page count, so tripping it
+# means the source grew past expectations or paging misbehaved — surface it loudly.
+_MAX_PAGES = 200_000
 
-# ~32/min per process => <=96/min across the 3 specs, under the documented
-# 120/min (~80% of the limit). Per-process; siblings hitting the same host do
-# not coordinate, hence the conservative ceiling.
+# Documented 120/min is shared across the 3 specs (per-key, server-side). Cap each
+# process at ~32/min => <=96/min combined, ~80% of the limit. Per-process limiter;
+# siblings don't coordinate, hence the conservative ceiling.
 _RATE_CALLS = 32
 _RATE_PERIOD = 60
 
@@ -113,8 +126,9 @@ def _require_key() -> str:
     key = os.environ.get("FRED_API_KEY")
     if not key:
         raise RuntimeError(
-            "FRED_API_KEY env var is required — FRED v2 needs a free 32-char "
-            "API key sent as 'Authorization: Bearer <key>'."
+            "FRED_API_KEY env var is required — FRED REST needs a free 32-char "
+            "API key (https://fredaccount.stlouisfed.org/apikey). v1 sends it as "
+            "the &api_key= query param; v2 sends it as 'Authorization: Bearer <key>'."
         )
     return key
 
@@ -122,7 +136,7 @@ def _require_key() -> str:
 @sleep_and_retry
 @limits(calls=_RATE_CALLS, period=_RATE_PERIOD)
 def _rate_limited_get(url: str, params: dict, headers: dict) -> httpx.Response:
-    return get(url, params=params, headers=headers, timeout=(10.0, 120.0))
+    return get(url, params=params, headers=headers, timeout=(10.0, 180.0))
 
 
 @retry(
@@ -131,128 +145,160 @@ def _rate_limited_get(url: str, params: dict, headers: dict) -> httpx.Response:
     wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
-def _get_json(path: str, **params) -> dict | list:
-    """GET a v2 endpoint as JSON. Retries transient failures; reraises the rest."""
-    headers = {"Authorization": f"Bearer {_require_key()}"}
-    full_params = {"file_type": "json", **params}
-    resp = _rate_limited_get(_BASE + path, full_params, headers)
+def _get_v1(path: str, **params) -> dict:
+    """GET a v1 endpoint as JSON. Key goes in the api_key query param."""
+    full = {"file_type": "json", "api_key": _require_key(), **params}
+    resp = _rate_limited_get(_V1_BASE + path, full, {})
     resp.raise_for_status()  # inside the retry, so 429/5xx get retried
     return resp.json()
 
 
-def _extract_records(payload, preferred_keys: tuple[str, ...]) -> list[dict]:
-    """Pull the record list out of a v2 envelope without hardcoding its key.
-
-    The exact envelope is unverified (see module docstring), so try the likely
-    keys first, then fall back to the first list-of-dicts value present.
-    """
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in preferred_keys:
-            v = payload.get(k)
-            if isinstance(v, list):
-                return v
-        for v in payload.values():
-            if isinstance(v, list) and (not v or isinstance(v[0], dict)):
-                return v
-    return []
+@retry(
+    retry=retry_if_exception(_is_transient),
+    stop=stop_after_attempt(6),
+    wait=wait_exponential(min=4, max=120),
+    reraise=True,
+)
+def _get_v2(path: str, **params) -> dict:
+    """GET a v2 endpoint as JSON. Key goes in the Authorization: Bearer header."""
+    headers = {"Authorization": f"Bearer {_require_key()}"}
+    full = {"format": "json", **params}
+    resp = _rate_limited_get(_V2_BASE + path, full, headers)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def _envelope_count(payload) -> int | None:
-    """Total record count if the envelope echoes it (v1 returns 'count').
+# --- v1 offset pagination ----------------------------------------------------
 
-    Used as the authoritative pagination terminator when present; falls back to
-    short-page detection otherwise. v2's envelope is unverified, so this is
-    best-effort: a non-int or absent 'count' just disables the optimisation.
-    """
-    if isinstance(payload, dict):
-        c = payload.get("count")
-        if isinstance(c, int):
-            return c
-    return None
+def _paginate_v1(path: str, base_params: dict, list_key: str):
+    """Yield records from a limit/offset-paginated v1 endpoint.
 
-
-def _page_signature(records: list[dict]) -> tuple:
-    """Cheap fingerprint of a page used to detect an API that ignores offset
-    (returns the same page repeatedly). Avoids holding whole pages in memory."""
-    if not records:
-        return (0,)
-    first, last = records[0], records[-1]
-    return (len(records), repr(first)[:200], repr(last)[:200])
-
-
-def _paginate(path: str, base_params: dict, preferred_keys: tuple[str, ...], page_limit: int):
-    """Yield records across offset-paginated pages.
-
-    Termination, in priority order:
-      1. envelope 'count' reached (authoritative when the API echoes it),
-      2. a short/empty page (fewer than page_limit records),
-      3. _MAX_PAGES safety cap (raises — signals runaway / ignored paging).
-    Also fails fast if two consecutive full pages are identical, which means the
-    server is ignoring offset and we'd otherwise duplicate to the cap.
+    Termination: the v1 envelope echoes an authoritative ``count``; we stop once
+    we've seen that many, or on a short page, whichever comes first. A page-count
+    safety cap raises if neither fires (paging not honoured / unbounded growth).
     """
     offset = 0
     pages = 0
     yielded = 0
-    prev_sig = None
     while True:
-        payload = _get_json(path, **base_params, limit=page_limit, offset=offset)
-        records = _extract_records(payload, preferred_keys)
-        sig = _page_signature(records)
-        if records and sig == prev_sig:
+        payload = _get_v1(path, **base_params, limit=_V1_PAGE_LIMIT, offset=offset)
+        records = payload.get(list_key, [])
+        if not isinstance(records, list):
             raise RuntimeError(
-                f"{path} (params={base_params}) returned an identical page at "
-                f"offset {offset} — the server is ignoring limit/offset paging."
+                f"{path}: expected list under '{list_key}', got "
+                f"{type(records).__name__} (envelope keys={list(payload)[:8]})"
             )
-        prev_sig = sig
         for rec in records:
             yield rec
         yielded += len(records)
         pages += 1
 
-        total = _envelope_count(payload)
-        if total is not None and yielded >= total:
+        count = payload.get("count")
+        if isinstance(count, int) and yielded >= count:
             return
-        if len(records) < page_limit:
+        if len(records) < _V1_PAGE_LIMIT:
             return
         if pages >= _MAX_PAGES:
             raise RuntimeError(
-                f"{path} (params={base_params}) exceeded {_MAX_PAGES} pages at "
-                f"offset {offset} — source grew past safety cap or pagination "
-                f"is not honouring limit/offset."
+                f"{path} (params={base_params}) exceeded {_MAX_PAGES} pages — "
+                f"source grew past safety cap or limit/offset not honoured."
             )
-        offset += page_limit
+        offset += _V1_PAGE_LIMIT
 
-
-# --- release enumeration -----------------------------------------------------
 
 def _list_releases() -> list[dict]:
-    rows = list(_paginate(
-        "/releases",
-        {"order_by": "release_id", "sort_order": "asc"},
-        ("releases",),
-        page_limit=_PAGE_LIMIT_SERIES,
+    rows = list(_paginate_v1(
+        "/releases", {"order_by": "release_id", "sort_order": "asc"}, "releases"
     ))
     if not rows:
         raise RuntimeError(
-            "/fred/v2/releases returned no records — wrong route, bad auth, or "
-            "an unexpected response envelope."
+            "/fred/releases returned no records — wrong route, bad auth, or an "
+            "unexpected response envelope."
         )
     return rows
 
 
-def _release_id(rec: dict):
-    rid = rec.get("id", rec.get("release_id"))
-    if rid is None:
-        raise KeyError(f"release record missing id field: {rec!r}")
-    return rid
+def _release_ids() -> list[int]:
+    ids = []
+    for rec in _list_releases():
+        rid = rec.get("id", rec.get("release_id"))
+        if rid is None:
+            raise KeyError(f"release record missing id field: {rec!r}")
+        ids.append(rid)
+    return ids
+
+
+# --- per-release row iterators -----------------------------------------------
+
+def _iter_series_rows(rid):
+    """v1 series metadata for one release. Yields the raw series dicts, stamped
+    with the originating release id so downstream can join."""
+    for rec in _paginate_v1("/release/series", {"release_id": rid}, "seriess"):
+        rec.setdefault("_release_id", rid)
+        yield rec
+
+
+def _iter_observation_rows(rid):
+    """v2 bulk observations for one release. Yields flat
+    {series_id, date, value, release_id} rows.
+
+    Cursor pagination: each page carries ``series`` (each with embedded
+    ``observations``), ``has_more`` and (while more) ``next_cursor``. A series can
+    straddle a page boundary — its observations simply continue on the next page;
+    flattening per page and concatenating into one batch file handles that for free.
+    """
+    cursor = None
+    pages = 0
+    prev_cursor = object()  # sentinel; never equal to a real cursor string
+    while True:
+        params = {"release_id": rid, "limit": _V2_OBS_LIMIT}
+        if cursor is not None:
+            params["next_cursor"] = cursor
+        payload = _get_v2("/release/observations", **params)
+
+        series_list = payload.get("series", [])
+        if not isinstance(series_list, list):
+            raise RuntimeError(
+                f"/release/observations release {rid}: expected list under "
+                f"'series', got {type(series_list).__name__} "
+                f"(envelope keys={list(payload)[:8]})"
+            )
+        for s in series_list:
+            sid = s.get("series_id")
+            for obs in s.get("observations", []):
+                yield {
+                    "series_id": sid,
+                    "date": obs.get("date"),
+                    "value": obs.get("value"),
+                    "release_id": rid,
+                }
+
+        pages += 1
+        if not payload.get("has_more"):
+            return
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            raise RuntimeError(
+                f"/release/observations release {rid}: has_more=true but no "
+                f"next_cursor — cannot continue pagination."
+            )
+        if cursor == prev_cursor:
+            raise RuntimeError(
+                f"/release/observations release {rid}: next_cursor did not advance "
+                f"({cursor!r}) — server is repeating a page."
+            )
+        prev_cursor = cursor
+        if pages >= _MAX_PAGES:
+            raise RuntimeError(
+                f"/release/observations release {rid} exceeded {_MAX_PAGES} pages "
+                f"— source grew past safety cap or cursor not advancing."
+            )
 
 
 # --- specs -------------------------------------------------------------------
 
 def fetch_releases(node_id: str) -> None:
-    """fred-releases — full pull of the ~300 release catalog. Stateless."""
+    """fred-releases — full pull of the ~300-release catalogue (v1). Stateless."""
     asset = node_id
     rows = _list_releases()
     save_raw_ndjson(rows, asset)
@@ -262,25 +308,20 @@ def fetch_releases(node_id: str) -> None:
     })
 
 
-def _firehose_by_release(
-    node_id: str,
-    subpath: str,
-    preferred_keys: tuple[str, ...],
-    page_limit: int,
-) -> None:
+def _firehose_by_release(node_id: str, row_iter) -> None:
     """Process releases one at a time, writing one NDJSON batch per release.
 
-    State carries the set of release ids completed this cycle (the watermark).
-    When every release is done, the cycle resets so the next run re-pulls from
-    the top — picking up revised observations. Bounded by MAX_FETCH_SECONDS.
+    ``row_iter`` is a callable ``rid -> iterator of dict rows``. State carries the
+    set of release ids completed this cycle (the watermark). When every release is
+    done the cycle resets so the next run re-pulls from the top. Bounded by
+    MAX_FETCH_SECONDS — hitting it returns cleanly with state advanced.
     """
     state = load_state(node_id)
     if state.get("schema_version") != STATE_VERSION:
         state = {"schema_version": STATE_VERSION}
     completed = set(state.get("completed", []))
 
-    releases = _list_releases()
-    all_ids = [_release_id(r) for r in releases]
+    all_ids = _release_ids()
     remaining = [rid for rid in all_ids if rid not in completed]
     if not remaining:
         print(f"{node_id}: all {len(all_ids)} releases done — starting new cycle", flush=True)
@@ -299,21 +340,22 @@ def _firehose_by_release(
             )
             break
 
-        asset = f"{node_id}-{rid}"  # batch key is pure release id, no slug
+        asset = f"{node_id}-{rid}"  # batch key is the pure release id, no slug
         try:
-            n = _write_release_batch(asset, subpath, rid, preferred_keys, page_limit)
+            n = _write_batch(asset, row_iter, rid)
         except httpx.HTTPStatusError as e:
             code = e.response.status_code
             if code in (400, 404):
-                # Permanent for this release only (e.g. release with no series /
-                # observations). Mark done for this cycle and move on.
+                # Permanent for THIS release only (e.g. a release with no series).
+                # Mark done for this cycle and move on — per-entity failure stays
+                # per-entity; the firehose does not raise out for one bad release.
                 print(f"{node_id}: release {rid} -> HTTP {code}, skipping", flush=True)
                 completed.add(rid)
                 save_state(node_id, {"schema_version": STATE_VERSION, "completed": sorted(completed)})
                 continue
             raise  # transient already retried; other 4xx is a real problem
 
-        # raw written first; then advance the watermark
+        # raw written first, then advance the watermark
         completed.add(rid)
         processed += 1
         records_this_run += n
@@ -328,30 +370,20 @@ def _firehose_by_release(
         })
         if processed % 10 == 0:
             print(
-                f"{node_id}: {processed} releases this run, "
-                f"{records_this_run} records ({len(completed)}/{len(all_ids)} this cycle)",
-                flush=True,
+                f"{node_id}: {processed} releases this run, {records_this_run} records "
+                f"({len(completed)}/{len(all_ids)} this cycle)", flush=True,
             )
 
 
-def _write_release_batch(
-    asset: str,
-    subpath: str,
-    rid,
-    preferred_keys: tuple[str, ...],
-    page_limit: int,
-) -> int:
-    """Stream one release's records to an NDJSON batch. Returns row count.
+def _write_batch(asset: str, row_iter, rid) -> int:
+    """Stream one release's rows to an NDJSON batch. Returns the row count.
 
     Streamed (not accumulated) because a single release's observations can be
-    very large. Empty batches are removed so no zero-row asset is left behind.
+    enormous. Empty batches are removed so no zero-row asset is left behind.
     """
     n = 0
     with raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip", encoding="utf-8") as fh:
-        for row in _paginate(subpath, {"release_id": rid}, preferred_keys, page_limit):
-            # Stamp the release id so downstream can join even if the bulk
-            # envelope omits it per-row.
-            row.setdefault("_release_id", rid)
+        for row in row_iter(rid):
             fh.write(json.dumps(row, separators=(",", ":")))
             fh.write("\n")
             n += 1
@@ -361,13 +393,13 @@ def _write_release_batch(
 
 
 def fetch_series(node_id: str) -> None:
-    """fred-series — series metadata per release (firehose)."""
-    _firehose_by_release(node_id, "/release/series", ("seriess", "series"), _PAGE_LIMIT_SERIES)
+    """fred-series — series metadata per release (v1 firehose)."""
+    _firehose_by_release(node_id, _iter_series_rows)
 
 
 def fetch_observations(node_id: str) -> None:
-    """fred-observations — observation history per release, v2 bulk (firehose)."""
-    _firehose_by_release(node_id, "/release/observations", ("observations",), _PAGE_LIMIT_OBS)
+    """fred-observations — observation history per release (v2 bulk firehose)."""
+    _firehose_by_release(node_id, _iter_observation_rows)
 
 
 DOWNLOAD_SPECS = [
