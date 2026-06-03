@@ -77,6 +77,16 @@ ENTITY_PATHS = {
     "pollster-ratings-raw_polls": "pollster-ratings/raw_polls.csv",
 }
 
+
+def _spec_id(entity_id: str) -> str:
+    # Contract: spec.id = f"fivethirtyeight-{entity_id.lower().replace('_','-')}".
+    return f"{_SLUG}-{entity_id.lower().replace('_', '-')}"
+
+
+# Final spec-id -> repo path. The runtime hands fetch_one its spec id, so we key
+# the fetch lookup by the same transformed id we register the NodeSpec under.
+SPEC_PATHS = {_spec_id(eid): path for eid, path in ENTITY_PATHS.items()}
+
 _TRANSIENT_EXC = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -114,8 +124,7 @@ def _fetch_csv(url: str) -> bytes:
 
 def fetch_one(node_id: str) -> None:
     asset = node_id  # the runtime passes the spec id; it IS the asset name
-    entity_id = node_id[len(_SLUG) + 1:]  # strip "fivethirtyeight-" prefix
-    path = ENTITY_PATHS[entity_id]  # KeyError = bug (spec set out of sync); let it raise
+    path = SPEC_PATHS[node_id]  # KeyError = bug (spec set out of sync); let it raise
     url = _BASE + path
 
     content = _fetch_csv(url)
@@ -127,10 +136,6 @@ def fetch_one(node_id: str) -> None:
 
 
 DOWNLOAD_SPECS = [
-    NodeSpec(
-        id=f"{_SLUG}-{entity_id}",
-        fn=fetch_one,
-        kind="download",
-    )
-    for entity_id in ENTITY_PATHS
+    NodeSpec(id=spec_id, fn=fetch_one, kind="download")
+    for spec_id in SPEC_PATHS
 ]
