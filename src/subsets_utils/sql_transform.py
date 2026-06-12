@@ -107,10 +107,11 @@ def run_sql_node(spec: SqlNodeSpec) -> None:
             record_read(f"raw/{rel}")
         print(f'[sql-transform] view "{dep}" <- {clause[:200]}')
 
-    # record_batch() streams — the result never fully materializes in memory.
-    # Peek until the first non-empty batch BEFORE writing: an empty result must
-    # fail without touching (and possibly clobbering) an existing good table.
-    reader = duckdb.sql(spec.sql).record_batch()
+    # fetch_record_batch() streams — the result never fully materializes in
+    # memory. Peek until the first non-empty batch BEFORE writing: an empty
+    # result must fail without touching (and possibly clobbering) an existing
+    # good table.
+    reader = duckdb.sql(spec.sql).fetch_record_batch()
     peeked = []
     for batch in reader:
         peeked.append(batch)
