@@ -18,7 +18,7 @@ change the hash. Behavioral edits (signature change, helper edit, constant
 value change) do.
 
 Used by:
-  - the harness DownloadStep pre-spawn to write expected_hashes.json
+  - the harness ImplementStep pre-spawn to write expected_hashes.json
   - the orchestrator post-success to stamp _metadata.code_hash
 Both layers call this same pure function so the values agree by construction.
 """
@@ -402,3 +402,17 @@ def compute_spec_hash(
         return h.hexdigest()
     except Exception:
         return None
+
+
+def compute_sql_spec_hash(sql: str) -> str | None:
+    """Hash a SqlNodeSpec's query text.
+
+    The SQL string IS the spec's whole body, so no AST walk — just
+    whitespace-normalize (cosmetic reflowing of the query must not force a
+    re-run) and sha256. Returns None on a non-string so callers get the same
+    force-re-run semantics as compute_spec_hash.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return None
+    normalized = " ".join(sql.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

@@ -1,4 +1,5 @@
 """NodeSpec: the unit the runtime DAG executes.
+SqlNodeSpec: a transform node whose body is one DuckDB SQL query.
 MaintainSpec: freshness policy consumed by the orchestrator pre-spawn."""
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +44,57 @@ class NodeSpec:
             )
         if not isinstance(self.deps, tuple):
             object.__setattr__(self, "deps", tuple(self.deps))
+
+
+_TRANSFORM_SUFFIX = "-transform"
+
+
+@dataclass(frozen=True)
+class SqlNodeSpec(NodeSpec):
+    """A transform node defined by one DuckDB SQL query instead of a Python fn.
+
+    Contract: raw asset(s) on R2 in → SQL → ONE Delta table out (overwrite).
+    The runtime (not the connector) owns execution: each id in `deps` is
+    registered as a DuckDB view named after that dep (quote it in SQL — ids
+    contain dashes: `FROM "slug-entity"`), `sql` runs against those views, and
+    the result is written with `overwrite()` to the Delta table named `id`
+    minus the "-transform" suffix. A query that yields zero rows fails the
+    node — the transform doubles as the correctness gate on raw.
+
+    `fn` is inherited but unused; it must stay None. `kind` is pinned to
+    "transform". `deps` must name at least one upstream node. Raw assets read
+    this way must be SQL-readable: parquet, ndjson/json, or csv (compressed
+    variants included) — anything else needs normalizing in the download fn.
+    """
+    fn: Callable | None = None
+    kind: str = "transform"
+    sql: str = ""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.fn is not None:
+            raise TypeError(
+                f"SqlNodeSpec {self.id!r}: fn must not be set — the runtime "
+                "executes `sql`; use a plain NodeSpec for Python transforms"
+            )
+        if not isinstance(self.sql, str) or not self.sql.strip():
+            raise ValueError(f"SqlNodeSpec {self.id!r}: sql must be a non-empty string")
+        if self.kind != "transform":
+            raise ValueError(
+                f"SqlNodeSpec {self.id!r}: kind must be 'transform' (got {self.kind!r})"
+            )
+        if not self.deps:
+            raise ValueError(
+                f"SqlNodeSpec {self.id!r}: deps must name at least one upstream "
+                "node — its raw asset is the SQL's input view"
+            )
+
+    @property
+    def table(self) -> str:
+        """Delta table name this node publishes: id minus the '-transform' suffix."""
+        if self.id.endswith(_TRANSFORM_SUFFIX):
+            return self.id[: -len(_TRANSFORM_SUFFIX)]
+        return self.id
 
 
 @dataclass(frozen=True)

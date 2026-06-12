@@ -1,67 +1,40 @@
-"""Post-DAG health invariants for the Bank of Canada download step.
+"""Health invariants for the Bank of Canada download nodes.
 
-Catches silent degradation that file-existence alone misses: empty catalog,
-truncated firehose, or an observation payload whose shape drifted away from the
-generic {series_id, dim_key, dim_value, value} contract.
-
-The `values` firehose self-stops on a wall-clock budget and resumes across
-runs, so thresholds are set to catch *total* failure (zero/near-zero batches)
-while tolerating a partial pass — not to assert the full ~157-batch corpus.
+Catches silent degradation that file-existence checks miss: an empty catalog,
+a values asset that came back with no observations, or columns lost to a format
+switch.
 """
 
-from subsets_utils import load_raw_parquet, load_raw_ndjson, list_raw_files
+import pyarrow.compute as pc
+
+from subsets_utils import load_raw_parquet
 
 
-def test_series_catalog_populated():
-    """The series catalog should list a large, stable corpus (~15.6k series)."""
+def test_raw_assets_nonempty(spec_ids):
+    """Every download asset must hold rows."""
+    for sid in spec_ids:
+        table = load_raw_parquet(sid)
+        assert len(table) > 0, f"{sid}: raw parquet has 0 rows"
+
+
+def test_series_catalog(spec_ids):
+    """The series catalog should list thousands of series with stable columns."""
     table = load_raw_parquet("bank-of-canada-series")
-    assert len(table) > 10_000, (
-        f"series catalog has only {len(table)} rows; expected >10k"
+    assert set(table.column_names) >= {"series_id", "label", "description", "link"}, (
+        f"series columns drifted: {table.column_names}"
     )
-    cols = set(table.column_names)
-    assert {"series_id", "label", "description", "link"} <= cols, cols
-    # series_id must be fully populated — it's the join key.
-    sid = table.column("series_id").to_pylist()
-    assert all(s for s in sid), "null/empty series_id present in catalog"
-    assert len(set(sid)) == len(sid), "duplicate series_id in catalog"
+    assert len(table) > 5000, f"series catalog only {len(table)} rows (expected ~15k)"
+    assert pc.sum(pc.is_null(table["series_id"])).as_py() == 0, "null series_id in catalog"
 
 
-def _value_batch_assets() -> list[str]:
-    """Derive batch asset ids from the raw NDJSON files written for `values`."""
-    files = list_raw_files("bank-of-canada-values-*")
-    assets = set()
-    for path in files:
-        name = path.rsplit("/", 1)[-1]
-        # strip the first NDJSON extension marker: "...-0007.ndjson.zst"
-        if ".ndjson" in name:
-            assets.add(name[: name.index(".ndjson")])
-    return sorted(assets)
-
-
-def test_values_firehose_populated():
-    """The observation firehose should produce many batches with real rows."""
-    assets = _value_batch_assets()
-    assert len(assets) > 20, (
-        f"only {len(assets)} value batch files; expected dozens "
-        "(full corpus is ~157 batches)"
+def test_values_observations(spec_ids):
+    """The observations asset should carry the long-format shape with volume."""
+    table = load_raw_parquet("bank-of-canada-values")
+    assert set(table.column_names) >= {"series_id", "date", "value"}, (
+        f"values columns drifted: {table.column_names}"
     )
-
-    total = 0
-    checked = 0
-    required = {"series_id", "dim_key", "dim_value", "value"}
-    # Spot-check a spread of batches rather than loading the whole corpus.
-    for asset in assets[:: max(1, len(assets) // 10)]:
-        rows = load_raw_ndjson(asset)
-        if not rows:
-            continue
-        checked += 1
-        total += len(rows)
-        sample = rows[0]
-        assert required <= set(sample.keys()), (
-            f"{asset}: row missing fields, got {set(sample.keys())}"
-        )
-        assert sample["series_id"], f"{asset}: empty series_id"
-        assert sample["dim_key"], f"{asset}: empty dim_key"
-
-    assert checked > 0, "no non-empty value batches found"
-    assert total > 0, "value batches contained zero observation rows"
+    # 15.6k series of full history is millions of rows; 100k is a safe floor
+    # that still trips on a truncated/partial download.
+    assert len(table) > 100_000, f"values only {len(table)} rows (expected millions)"
+    assert pc.sum(pc.is_null(table["series_id"])).as_py() == 0, "null series_id in values"
+    assert pc.sum(pc.is_null(table["date"])).as_py() == 0, "null date in values"

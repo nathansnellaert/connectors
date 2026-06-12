@@ -10,7 +10,7 @@ from .io import (
 )
 from .delta import merge, overwrite, append, WriteResult
 from .orchestrator import DAG, load_nodes
-from .spec import NodeSpec, MaintainSpec
+from .spec import NodeSpec, SqlNodeSpec, MaintainSpec
 from . import duckdb
 from .config import validate_environment, get_data_dir, is_cloud, get_fs
 from .publish import publish
@@ -37,5 +37,5 @@ __all__ = [
     # Config
     'validate_environment', 'get_data_dir', 'is_cloud', 'get_fs',
     # Other
-    'validate', 'run_health_tests', 'DAG', 'load_nodes', 'NodeSpec', 'MaintainSpec', 'duckdb',
+    'validate', 'run_health_tests', 'DAG', 'load_nodes', 'NodeSpec', 'SqlNodeSpec', 'MaintainSpec', 'duckdb',
 ]

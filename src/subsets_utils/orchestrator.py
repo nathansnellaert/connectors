@@ -50,8 +50,8 @@ from typing import Callable
 
 from . import tracking
 from .io import record_completion, _load_state_raw
-from .spec import MaintainSpec, NodeSpec
-from .spec_hash import compute_spec_hash
+from .spec import MaintainSpec, NodeSpec, SqlNodeSpec
+from .spec_hash import compute_spec_hash, compute_sql_spec_hash
 from .tracking import (
     clear_tracking,
     get_asset_version,
@@ -298,7 +298,11 @@ class DAG:
                 "deps": list(spec.deps),
                 # Where the fetch/transform fn was def'd — for debugging.
                 # functools.wraps preserves this through decorators (@tenacity.retry etc).
-                "source_module": getattr(spec.fn, "__module__", None),
+                # SQL nodes have no fn; the runtime executor is their source.
+                "source_module": (
+                    "subsets_utils.sql_transform" if isinstance(spec, SqlNodeSpec)
+                    else getattr(spec.fn, "__module__", None)
+                ),
                 "status": "pending",
                 "started_at": None,
                 "finished_at": None,
@@ -330,6 +334,10 @@ class DAG:
         #                                to today.
         self._current_hashes: dict[str, str | None] = {}
         for spec in specs:
+            if isinstance(spec, SqlNodeSpec):
+                # The SQL text is the node's whole body — hash it directly.
+                self._current_hashes[spec.id] = compute_sql_spec_hash(spec.sql)
+                continue
             try:
                 import inspect as _inspect
                 src_file = _inspect.getsourcefile(spec.fn)
@@ -474,9 +482,17 @@ class DAG:
         inherits the read-end too but never uses it; that's harmless.
         """
         pipe_r, pipe_w = _MP_CTX.Pipe(duplex=False)
+        if isinstance(spec, SqlNodeSpec):
+            # SQL nodes have no connector fn — the runtime owns execution. The
+            # runner is a top-level importable and the spec (id/deps/sql,
+            # fn=None) pickles cleanly, so spawn-context is satisfied.
+            from .sql_transform import run_sql_node
+            fn, args = run_sql_node, (spec,)
+        else:
+            fn, args = spec.fn, (spec.id,)
         proc = _MP_CTX.Process(
             target=_child_entrypoint,
-            args=(spec.fn, (spec.id,), spec.id, pipe_w),
+            args=(fn, args, spec.id, pipe_w),
             name=f"node:{spec.id}",
         )
         proc.start()
