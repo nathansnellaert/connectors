@@ -1,29 +1,39 @@
 """BIS bulk-CSV connector.
 
-One download node per BIS dataflow (entity union). For each dataflow we fetch
-the persistent bulk export ``https://data.bis.org/static/bulk/{ID}_csv_flat.zip``
-(the *flat* / tidy-long variant — the ``_csv_col`` variant pivots every time
-period into its own column, producing 30k+ columns, so it is unusable). Each zip
-holds a single CSV with SDMX-style columns ``CODE:Label`` (e.g.
-``FREQ:Frequency``, ``TIME_PERIOD:Time period or range``,
-``OBS_VALUE:Observation Value``). The dimension set differs per dataflow (each
-has its own DSD), so raw is written as NDJSON (drifty schema) with the column
-codes stripped to the bare SDMX code as keys.
+One download node per BIS dataflow (the entity union). For each dataflow we
+fetch the persistent bulk export
+``https://data.bis.org/static/bulk/{ID}_csv_flat.zip`` (the *flat* / tidy-long
+variant — the ``_csv_col`` variant pivots every time period into its own column,
+producing 30k+ columns, so it is unusable). Each zip holds a single CSV with
+SDMX-style headers ``CODE:Label`` (e.g. ``FREQ:Frequency``,
+``TIME_PERIOD:Time period or range``, ``OBS_VALUE:Observation Value``). The
+dimension set differs per dataflow (each has its own DSD).
 
-Strategy: stateless full re-pull. Each zip is the entire history of its topic and
-URLs are persistent across releases, so we re-fetch and overwrite every run; the
-maintain step gates whether a given fetch runs. The largest dataflow
+Raw format: **parquet with an explicit all-VARCHAR schema** built from the CSV
+header at fetch time. Every cell is stored as text. This is deliberate — the
+prior NDJSON attempt let DuckDB's ``read_json_auto`` infer column types from a
+sample, and it guessed ``DATE`` for ``TIME_PERIOD`` (which is "1948" for annual
+dataflows, "2024-Q1" for quarterly, "2002-06-03" for daily) and ``JSON`` for
+columns that are all-null in the sample (``TIME_FORMAT``, ``OBS_PRE_BREAK``),
+then errored at the first later line that didn't match. An explicit VARCHAR
+parquet schema removes inference entirely, so DuckDB reads every column as text
+and the transform does the casting with ``TRY_CAST``.
+
+Strategy: stateless full re-pull. Each zip is the entire history of its topic
+and the URLs are persistent across releases, so we re-fetch and overwrite every
+run; the maintain step gates whether a given fetch runs. The largest dataflow
 (WS_LBS_D_PUB) is a ~356MB zip / multi-GB CSV, so parsing is streamed straight
-from the zip member into a gzipped NDJSON writer — never materialised in memory.
+from the zip member into a row-group-streamed parquet writer — the full table is
+never materialised in memory.
 """
 
 import csv
 import io
-import json
 import time
 import zipfile
 
 import httpx
+import pyarrow as pa
 from tenacity import (
     retry,
     retry_if_exception,
@@ -36,13 +46,14 @@ from subsets_utils import (
     SqlNodeSpec,
     get,
     load_state,
-    raw_writer,
+    raw_parquet_writer,
     save_state,
 )
 
 STATE_VERSION = 1
 BASE_URL = "https://data.bis.org/static/bulk"
 SKIP_TTL_SECONDS = 14 * 86400
+BATCH_ROWS = 50_000  # rows per parquet row group flush
 
 # The entity union — BIS dataflow ids that rank scored at/above the publish
 # threshold. One download + one transform per id.
@@ -114,6 +125,15 @@ def _entity_id(node_id: str) -> str:
     return node_id[len("bis-"):].upper().replace("-", "_")
 
 
+def _mark_skipped(asset: str, eid: str, reason: str) -> None:
+    state = load_state(asset)
+    skipped = state.get("skipped", {})
+    skipped[eid] = {"reason": reason, "expires_at": int(time.time()) + SKIP_TTL_SECONDS}
+    state["skipped"] = skipped
+    state["schema_version"] = STATE_VERSION
+    save_state(asset, state)
+
+
 def fetch_one(node_id: str) -> None:
     asset = node_id  # the runtime passes the spec id; it IS the asset name
     eid = _entity_id(node_id)
@@ -127,15 +147,7 @@ def fetch_one(node_id: str) -> None:
             # Permanent: this dataflow's bulk export is gone. Mark skipped with a
             # TTL and return so one bad entity doesn't sink the whole step.
             print(f"{asset}: permanent HTTP {code} for {url}; skipping", flush=True)
-            state = load_state(asset)
-            skipped = state.get("skipped", {})
-            skipped[eid] = {
-                "reason": f"HTTP {code}",
-                "expires_at": int(time.time()) + SKIP_TTL_SECONDS,
-            }
-            state["skipped"] = skipped
-            state["schema_version"] = STATE_VERSION
-            save_state(asset, state)
+            _mark_skipped(asset, eid, f"HTTP {code}")
             return
         raise
 
@@ -145,34 +157,55 @@ def fetch_one(node_id: str) -> None:
         raise AssertionError(f"{asset}: empty zip from {url}")
     member = members[0]
 
-    n = 0
-    # Stream straight from the zip member into gzipped NDJSON — never build the
-    # full (multi-GB) CSV or row list in memory.
-    with raw_writer(asset, "ndjson.gz", mode="wt", compression="gzip") as out:
-        with zf.open(member) as fh:
-            text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
-            reader = csv.reader(text)
-            header = next(reader)
-            # SDMX bulk headers are "CODE:Label" — keep just the code as the key.
-            keys = [h.split(":", 1)[0].strip() for h in header]
-            try:
-                obs_idx = keys.index("OBS_VALUE")
-            except ValueError:
-                raise AssertionError(
-                    f"{asset}: OBS_VALUE column missing, header={keys}"
+    with zf.open(member) as fh:
+        text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
+        reader = csv.reader(text)
+        header = next(reader)
+        # SDMX bulk headers are "CODE:Label" — keep just the code as the column.
+        keys = [h.split(":", 1)[0].strip() for h in header]
+        if len(set(keys)) != len(keys):
+            raise AssertionError(f"{asset}: duplicate column codes in header {keys}")
+        try:
+            obs_idx = keys.index("OBS_VALUE")
+        except ValueError:
+            raise AssertionError(f"{asset}: OBS_VALUE column missing, header={keys}")
+        ncols = len(keys)
+
+        # Every column stored as VARCHAR — no type inference anywhere downstream.
+        schema = pa.schema([(k, pa.string()) for k in keys])
+
+        n = 0
+        cols: list[list] = [[] for _ in range(ncols)]
+        with raw_parquet_writer(asset, schema, compression="zstd") as writer:
+            def _flush() -> None:
+                if not cols[0]:
+                    return
+                batch = pa.record_batch(
+                    [pa.array(c, type=pa.string()) for c in cols], schema=schema
                 )
-            ncols = len(keys)
+                writer.write_batch(batch)
+                for c in cols:
+                    c.clear()
+
             for row in reader:
                 if len(row) != ncols:
                     continue  # malformed line
                 if not row[obs_idx]:
                     continue  # series-definition row with no observation
-                rec = {k: (v if v != "" else None) for k, v in zip(keys, row)}
-                out.write(json.dumps(rec, ensure_ascii=False))
-                out.write("\n")
+                for i in range(ncols):
+                    v = row[i]
+                    cols[i].append(v if v != "" else None)
                 n += 1
-                if n % 500000 == 0:
-                    print(f"{asset}: {n} observations", flush=True)
+                if len(cols[0]) >= BATCH_ROWS:
+                    _flush()
+                    if n % 500_000 == 0:
+                        print(f"{asset}: {n} observations", flush=True)
+            _flush()
+
+    if n == 0:
+        raise AssertionError(
+            f"{asset}: zip {url} yielded 0 observations — format may have changed"
+        )
 
     print(f"{asset}: wrote {n} observations from {url}", flush=True)
 
@@ -193,11 +226,12 @@ DOWNLOAD_SPECS: list[NodeSpec] = [
 ]
 
 
-# One published Delta table per dataflow. The dimension columns differ per
-# dataflow, so the SQL is generic: drop the constant SDMX envelope columns
-# (STRUCTURE, ACTION), cast OBS_VALUE to DOUBLE, and keep every observation that
-# carries a numeric value. TIME_PERIOD is left as text because its granularity
-# ranges from annual ("1948") to daily ("2002-06-03") across dataflows.
+# One published Delta table per dataflow. Every raw column is VARCHAR, so the
+# SQL is generic: drop the constant SDMX envelope columns (STRUCTURE, ACTION),
+# cast OBS_VALUE to DOUBLE, and keep every observation that carries a numeric
+# value. TIME_PERIOD stays text because its granularity ranges from annual
+# ("1948") through quarterly ("2024-Q1") to daily ("2002-06-03") across
+# dataflows; downstream consumers parse it per FREQ.
 TRANSFORM_SPECS: list[SqlNodeSpec] = [
     SqlNodeSpec(
         id=f"{s.id}-transform",

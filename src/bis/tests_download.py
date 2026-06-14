@@ -1,50 +1,48 @@
 """Health-invariant tests for the BIS bulk-CSV connector.
 
-Each download asset is a gzipped NDJSON stream of observations — potentially
-multi-GB (WS_LBS_D_PUB), so tests stream the first lines rather than loading the
-whole asset into memory.
+Each download asset is a zstd-compressed parquet of SDMX observations, with
+every column stored as VARCHAR. WS_LBS_D_PUB is multi-GB, so the tests read the
+parquet footer (row count + schema) and at most a single row group rather than
+loading whole assets into memory.
 """
 
-import json
+import pyarrow.parquet as pq
 
 from subsets_utils import list_raw_files, raw_reader
 
-# Streaming sample per asset — enough to prove the payload is real NDJSON of
-# observations, cheap enough for the multi-GB assets.
-_SAMPLE_LINES = 2000
-
-
-def _sample(sid: str, limit: int = _SAMPLE_LINES) -> list[dict]:
-    rows: list[dict] = []
-    with raw_reader(sid, "ndjson.gz", mode="rt", compression="gzip") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-            if len(rows) >= limit:
-                break
-    return rows
-
 
 def test_all_raw_assets_present(spec_ids):
-    """Every download spec should have produced a raw NDJSON file. A missing
+    """Every download spec should have produced a raw parquet file. A missing
     file means the bulk zip vanished or the fetch crashed silently."""
-    missing = [sid for sid in spec_ids if not list_raw_files(f"{sid}.ndjson.gz")]
-    assert not missing, f"raw NDJSON missing for: {missing}"
+    missing = [sid for sid in spec_ids if not list_raw_files(f"{sid}.parquet")]
+    assert not missing, f"raw parquet missing for: {missing}"
 
 
-def test_raw_assets_have_observations(spec_ids):
-    """Sampled rows must carry a numeric OBS_VALUE and a TIME_PERIOD — guards
-    against the endpoint switching format or returning the wide layout."""
+def test_raw_assets_nonempty(spec_ids):
+    """Every asset must hold observations. Empty payloads usually mean the
+    endpoint switched format or returned the wide (_csv_col) layout."""
     for sid in spec_ids:
-        rows = _sample(sid)
-        assert rows, f"{sid}: no observations in raw NDJSON"
-        first = rows[0]
-        assert "OBS_VALUE" in first, f"{sid}: rows lack OBS_VALUE, keys={list(first)[:8]}"
-        assert "TIME_PERIOD" in first, f"{sid}: rows lack TIME_PERIOD, keys={list(first)[:8]}"
-        # every sampled OBS_VALUE must be a finite number (we drop empties in fetch)
-        bad = [r.get("OBS_VALUE") for r in rows if not _is_number(r.get("OBS_VALUE"))]
+        with raw_reader(sid, "parquet", mode="rb") as fh:
+            n = pq.ParquetFile(fh).metadata.num_rows
+        assert n > 0, f"{sid}: raw parquet has 0 rows"
+
+
+def test_raw_assets_have_expected_columns(spec_ids):
+    """Each asset must carry OBS_VALUE and TIME_PERIOD (every BIS dataflow has
+    them), and a sampled batch's OBS_VALUE must be numeric — guards against the
+    endpoint switching format or a parser regression that shifts columns."""
+    for sid in spec_ids:
+        with raw_reader(sid, "parquet", mode="rb") as fh:
+            pf = pq.ParquetFile(fh)
+            names = set(pf.schema_arrow.names)
+            assert "OBS_VALUE" in names, f"{sid}: no OBS_VALUE column, cols={sorted(names)[:8]}"
+            assert "TIME_PERIOD" in names, f"{sid}: no TIME_PERIOD column, cols={sorted(names)[:8]}"
+            # Sample the first row group only.
+            batch = next(pf.iter_batches(batch_size=2000, columns=["OBS_VALUE"]))
+            vals = batch.column("OBS_VALUE").to_pylist()
+        sample = [v for v in vals if v is not None][:500]
+        assert sample, f"{sid}: first 2000 rows all have null OBS_VALUE"
+        bad = [v for v in sample if not _is_number(v)]
         assert not bad, f"{sid}: non-numeric OBS_VALUE samples: {bad[:5]}"
 
 
