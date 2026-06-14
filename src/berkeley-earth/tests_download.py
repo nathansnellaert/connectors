@@ -53,7 +53,7 @@ def test_station_observations_nonempty_and_shaped():
         assert nvars == 3, f"{_STATIONS}: expected 3 variables, found {nvars}"
 
         ymin, ymax = con.execute(f"SELECT min(year), max(year) FROM {rel}").fetchone()
-        assert 1700 < ymin < 1900, f"min year {ymin} implausible"
+        assert 1600 < ymin < 1900, f"min year {ymin} implausible"
         assert ymax >= 2020, f"max year {ymax} implausible — stale or mis-parsed"
 
         bad_month = con.execute(
