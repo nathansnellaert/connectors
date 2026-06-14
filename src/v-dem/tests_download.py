@@ -13,14 +13,21 @@ _MIN_ROWS = {"v-dem-vdem": 20000, "v-dem-vparty": 5000}
 _MIN_COLS = {"v-dem-vdem": 1000, "v-dem-vparty": 200}
 
 
+def _download_ids(spec_ids):
+    """spec_ids carries EVERY DAG node id — downloads and transforms. Only the
+    download nodes write raw parquet; transforms publish Delta tables. Filter to
+    the raw-bearing download assets."""
+    return [s for s in spec_ids if not s.endswith("-transform")]
+
+
 def test_all_raw_assets_nonempty(spec_ids):
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         table = load_raw_parquet(sid)
         assert len(table) > 0, f"{sid}: raw parquet has 0 rows"
 
 
 def test_raw_assets_meet_floors(spec_ids):
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         table = load_raw_parquet(sid)
         floor = _MIN_ROWS.get(sid)
         if floor is not None:
@@ -38,7 +45,7 @@ def test_raw_assets_meet_floors(spec_ids):
 
 def test_key_columns_present(spec_ids):
     """Panel keys the transform filters on must exist in every raw asset."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         names = set(load_raw_parquet(sid).schema.names)
         assert "year" in names, f"{sid}: missing 'year' column"
         if sid == "v-dem-vdem":
