@@ -2,27 +2,34 @@
 
 WATER  (9 entities): USGS Water Data OGC API Features
     https://api.waterdata.usgs.gov/ogcapi/v0/collections/<id>/items
-    Each collection is a GeoJSON FeatureCollection paged via a cursor `next`
-    link. The observation collections (continuous, daily, ...) are effectively
-    unbounded (billions of observations) and there is no whole-corpus bulk dump
-    nor a stable monotonic key we can resume against (the cursor is opaque), so
-    a full re-pull is infeasible and a resumable watermark is not well-defined.
-    We therefore publish a *bounded rolling snapshot*: a deterministic crawl of
-    the first WATER_MAX_PAGES pages from the start of each collection, one
-    NDJSON batch per page. Re-running overwrites the same batch files
-    (idempotent). Properties differ per collection and are full of nullable /
-    occasionally-nested fields, so raw is NDJSON (drift-tolerant) with non-scalar
-    property values JSON-encoded to keep every column SQL-readable; the transform
-    re-types per collection.
+    Each collection is a GeoJSON FeatureCollection paged via an opaque cursor
+    `next` link (there is no total/`numberMatched`; the last page simply omits
+    the `next` link). The observation collections (continuous, daily, ...) are
+    effectively unbounded (hundreds of millions of observations) and there is no
+    whole-corpus bulk dump nor a stable monotonic key we can resume against (the
+    cursor is opaque), so a full re-pull is infeasible and a resumable watermark
+    is not well-defined. We therefore publish a *bounded rolling snapshot*: a
+    deterministic crawl of the first WATER_MAX_PAGES pages from the start of each
+    collection. Re-running overwrites the same asset (idempotent).
+
+    Raw is written as a single parquet per collection with an all-string schema
+    derived from the union of property keys observed in the crawl, plus the
+    geometry lon/lat. Strings make the schema stable and drift-proof across the
+    crawl (the transform re-types via TRY_CAST); nested property values
+    (thresholds, list qualifiers) are JSON-encoded so every column stays a flat
+    SQL-readable scalar.
 
 EARTHQUAKES (1 entity, `events`): USGS ComCat via the FDSN Event service
     https://earthquake.usgs.gov/fdsnws/event/1/query  (chosen mechanism)
     Full catalog is millions of events back to ~1900; a single query is capped
-    at 20000 events. There is no bulk dump, so we publish a bounded rolling
-    snapshot of the last EQ_MONTHS_BACK calendar months (all magnitudes), one
-    NDJSON batch per month, each window offset-paged under the 20000 cap. CSV is
-    the flattest format; we parse it to dicts. Re-running overwrites the same
-    month batches (idempotent); the current partial month refreshes each run.
+    at 20000 events (HTTP 400 over). There is no bulk dump, so we publish a
+    bounded rolling snapshot of the last EQ_MONTHS_BACK calendar months (all
+    magnitudes), one parquet batch per month written with a FIXED explicit
+    schema (the 22 stable FDSN CSV columns, all string) so the per-month files
+    glob-union cleanly at read time. Each window is offset-paged under the 20000
+    cap and sized against observed volume (~11k events/month << cap). CSV is the
+    flattest format; we parse it to dicts. Re-running overwrites the same month
+    batches (idempotent); the current partial month refreshes each run.
 
 Freshness gating is the maintain step's job — these fns always fetch when run.
 Both surfaces are stateless full-snapshot crawls: no watermark, no cursor
@@ -32,10 +39,12 @@ execution and trivially idempotent.
 
 import csv
 import io
+import json
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 import httpx
+import pyarrow as pa
 from tenacity import (
     retry,
     retry_if_exception,
@@ -47,7 +56,7 @@ from subsets_utils import (
     NodeSpec,
     SqlNodeSpec,
     get,
-    save_raw_ndjson,
+    save_raw_parquet,
 )
 
 # ---------------------------------------------------------------------------
@@ -105,11 +114,44 @@ def _http_get(url: str, params: dict) -> httpx.Response:
     return resp
 
 
+def _stringify(value):
+    """Coerce any JSON value to a flat string (or None) so the parquet schema is
+    uniformly string and drift-proof. dict/list -> compact JSON; bool -> json
+    literal; everything else -> str()."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"))
+    return str(value)
+
+
+def _all_string_table(rows: list[dict], extra_cols: tuple[str, ...] = ()) -> pa.Table:
+    """Build a single all-string pa.Table from heterogeneous dict rows. Column
+    set is the union of keys (insertion-ordered) plus any required extra_cols, so
+    the schema is stable regardless of which optional keys appeared."""
+    cols: list[str] = []
+    seen: set[str] = set()
+    for c in extra_cols:
+        if c not in seen:
+            seen.add(c)
+            cols.append(c)
+    for r in rows:
+        for k in r:
+            if k not in seen:
+                seen.add(k)
+                cols.append(k)
+    schema = pa.schema([(c, pa.string()) for c in cols])
+    normalized = [{c: r.get(c) for c in cols} for r in rows]
+    return pa.Table.from_pylist(normalized, schema=schema)
+
+
 # ===========================================================================
-# WATER — cursor-paged OGC API Features crawl (bounded snapshot, NDJSON batches)
+# WATER — cursor-paged OGC API Features crawl (bounded snapshot, one parquet)
 # ===========================================================================
 WATER_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0/collections"
-WATER_PAGE_LIMIT = 5000        # features per page (API allows up to 20000)
+WATER_PAGE_LIMIT = 5000        # features per page (verified accepted)
 WATER_MAX_PAGES = 6            # bounded snapshot depth — see module docstring
 
 
@@ -120,29 +162,21 @@ def _extract_cursor(href: str) -> str | None:
     return vals[0] if vals else None
 
 
-def _scalarize(value):
-    """Keep scalars; JSON-encode dict/list values so every NDJSON column stays a
-    flat, uniformly-typed scalar that DuckDB's read_json can union cleanly."""
-    if isinstance(value, (dict, list)):
-        import json
-        return json.dumps(value, separators=(",", ":"))
-    return value
-
-
 def _flatten_feature(feature: dict) -> dict:
-    """One GeoJSON feature -> a flat dict: properties + geometry lon/lat."""
-    props = {k: _scalarize(v) for k, v in (feature.get("properties") or {}).items()}
+    """One GeoJSON feature -> a flat all-string dict: properties + geometry
+    lon/lat. observation collections carry their id at the feature level (not in
+    properties) so it is preserved under _feature_id when absent from props."""
+    props = {k: _stringify(v) for k, v in (feature.get("properties") or {}).items()}
     geom = feature.get("geometry") or {}
     lon = lat = None
     if isinstance(geom, dict):
         coords = geom.get("coordinates")
         if isinstance(coords, list) and len(coords) >= 2:
             lon, lat = coords[0], coords[1]
-    props["_geometry_lon"] = lon
-    props["_geometry_lat"] = lat
+    props["_geometry_lon"] = _stringify(lon)
+    props["_geometry_lat"] = _stringify(lat)
     if "id" not in props:
-        # observation collections carry their id at the feature level
-        props["_feature_id"] = feature.get("id")
+        props["_feature_id"] = _stringify(feature.get("id"))
     return props
 
 
@@ -152,7 +186,7 @@ def fetch_water(node_id: str) -> None:
     items_url = f"{WATER_BASE}/{entity}/items"
 
     cursor = None
-    total = 0
+    rows: list[dict] = []
     for seq in range(WATER_MAX_PAGES):
         params = {"f": "json", "limit": WATER_PAGE_LIMIT}
         if cursor:
@@ -161,11 +195,8 @@ def fetch_water(node_id: str) -> None:
         feats = payload.get("features") or []
         if not feats:
             break                            # collection exhausted before the cap
-
-        rows = [_flatten_feature(ft) for ft in feats]
-        save_raw_ndjson(rows, f"{asset}-{seq:06d}")   # raw write per page
-        total += len(rows)
-        print(f"[{asset}] page {seq + 1}/{WATER_MAX_PAGES}, {total} rows", flush=True)
+        rows.extend(_flatten_feature(ft) for ft in feats)
+        print(f"[{asset}] page {seq + 1}/{WATER_MAX_PAGES}, {len(rows)} rows", flush=True)
 
         nxt = next(
             (l.get("href") for l in payload.get("links", []) if l.get("rel") == "next"),
@@ -175,20 +206,34 @@ def fetch_water(node_id: str) -> None:
         if cursor is None:
             break                            # reached the last page exactly
 
-    if total == 0:
+    if not rows:
         # A collection that returns zero features on its very first page is a
         # real upstream change, not normal — surface it loudly.
         raise RuntimeError(f"{asset}: water collection returned no features")
-    print(f"[{asset}] done: {total} rows", flush=True)
+
+    # geometry columns are always present so the transform's lon/lat refs resolve
+    # even for collections whose features carry no geometry.
+    table = _all_string_table(rows, extra_cols=("_geometry_lon", "_geometry_lat"))
+    save_raw_parquet(table, asset)
+    print(f"[{asset}] done: {table.num_rows} rows, {len(table.column_names)} cols", flush=True)
 
 
 # ===========================================================================
-# EARTHQUAKES — month-windowed FDSN crawl (bounded snapshot, NDJSON batches)
+# EARTHQUAKES — month-windowed FDSN crawl (bounded snapshot, parquet per month)
 # ===========================================================================
 FDSN_QUERY = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 FDSN_PAGE = 20000                       # hard per-query cap of the service
 FDSN_OFFSET_CAP = 200_000               # safety: a single month exceeding this
 EQ_MONTHS_BACK = 24                     # bounded snapshot horizon (months)
+
+# The FDSN CSV header is fixed; pin it as the explicit per-month parquet schema
+# so every month batch shares an identical schema and read_parquet unions them.
+EVENT_COLS = (
+    "time", "latitude", "longitude", "depth", "mag", "magType", "nst", "gap",
+    "dmin", "rms", "net", "id", "updated", "place", "type", "horizontalError",
+    "depthError", "magError", "magNst", "status", "locationSource", "magSource",
+)
+EVENT_SCHEMA = pa.schema([(c, pa.string()) for c in EVENT_COLS])
 
 
 def _iso(dt: datetime) -> str:
@@ -234,7 +279,7 @@ def _query_events(start: datetime, end: datetime) -> list[dict]:
         )
         text = resp.text
         if not text.strip():
-            break                                  # 204 / empty window
+            break                                  # empty window
         page = [dict(r) for r in csv.DictReader(io.StringIO(text))]
         if not page:
             break
@@ -257,7 +302,11 @@ def fetch_earthquakes(node_id: str) -> None:
     for label, start, end in _month_windows(now, EQ_MONTHS_BACK):
         rows = _query_events(start, end)
         if rows:
-            save_raw_ndjson(rows, f"{asset}-{label}")   # one batch per month
+            # Project onto the fixed column set; any unexpected extra CSV column
+            # is dropped, any missing one is null — schema stays identical.
+            normalized = [{c: r.get(c) for c in EVENT_COLS} for r in rows]
+            table = pa.Table.from_pylist(normalized, schema=EVENT_SCHEMA)
+            save_raw_parquet(table, f"{asset}-{label}")   # one batch per month
             total += len(rows)
         print(f"[{asset}] {label}: {len(rows)} events ({total} total)", flush=True)
     if total == 0:
@@ -285,6 +334,7 @@ DOWNLOAD_SPECS = [
 # ===========================================================================
 # TRANSFORM_SPECS — one published Delta table per subset. Thin parse/type +
 # dedup of overlap duplicates (QUALIFY row_number by natural key, newest wins).
+# Raw is all-string parquet, so numerics/timestamps are recovered via TRY_CAST.
 # ===========================================================================
 _TRANSFORM_SQL = {
     "channel-measurements": '''
