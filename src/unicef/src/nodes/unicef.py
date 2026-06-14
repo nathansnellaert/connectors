@@ -55,7 +55,7 @@ BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/"
 CSV_ACCEPT = "application/vnd.sdmx.data+csv;version=1.0.0"
 
 # Entity union (authoritative coverage target) — copied from
-# data/sources/unicef/steps/3cf023c9b4664a259af1e2260f46746f/entity_union.json
+# data/sources/unicef/steps/534fb1dfd81640fc96121a7e73b1c9a7/entity_union.json
 ENTITY_IDS = [
     "CAUSE_OF_DEATH", "CCRI", "CHILD_RELATED_SDG", "CHLD_PVTY", "CME",
     "CME_CAUSE_OF_DEATH", "CME_SUBNATIONAL", "DM", "DM_PROJECTIONS", "ECD",
@@ -122,11 +122,12 @@ def _split_cell(value: str) -> tuple[str, str]:
     wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
-def _download_flow(asset: str, flow: str, version: str) -> int:
+def _download_flow(asset: str, flow: str) -> int:
     """Stream one dataflow's SDMX-CSV and write it as NDJSON.gz. Returns the
     number of observation rows written. Retried as a whole on transient errors;
     raw_writer truncates on each attempt, so a retry is idempotent."""
-    url = f"{BASE}data/UNICEF,{flow},{version}/all"
+    # Version omitted -> SDMX resolves the latest published version.
+    url = f"{BASE}data/UNICEF,{flow}/all"
     client = get_client()
     written = 0
     with client.stream(
@@ -166,9 +167,8 @@ def _download_flow(asset: str, flow: str, version: str) -> int:
 def fetch_one(node_id: str) -> None:
     asset = node_id  # the runtime passes the spec id; it IS the asset name
     entity = node_id[len("unicef-"):].replace("-", "_").upper()
-    version = VERSIONS.get(entity, "1.0")
-    n = _download_flow(asset, entity, version)
-    print(f"{asset}: wrote {n} rows (flow={entity}, version={version})", flush=True)
+    n = _download_flow(asset, entity)
+    print(f"{asset}: wrote {n} rows (flow={entity})", flush=True)
     if n == 0:
         # A flow that exists but returns no observations is a real anomaly —
         # surface it rather than publishing an empty table.
