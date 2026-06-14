@@ -29,8 +29,16 @@ _REQUIRED_COL = {
 }
 
 
+def _download_ids(spec_ids):
+    """spec_ids carries every node that ran — downloads AND `-transform` leaves.
+    Only downloads write raw parquet, so restrict to the known download set."""
+    return [sid for sid in spec_ids if sid in _MIN_ROWS]
+
+
 def test_raw_assets_have_expected_rows(spec_ids):
-    for sid in spec_ids:
+    ids = _download_ids(spec_ids)
+    assert ids, f"no download spec ids found in {spec_ids}"
+    for sid in ids:
         with raw_parquet_localpath(sid) as path:
             meta = pq.ParquetFile(path).metadata
             floor = _MIN_ROWS.get(sid, 1)
@@ -40,7 +48,7 @@ def test_raw_assets_have_expected_rows(spec_ids):
 
 
 def test_raw_assets_have_required_columns(spec_ids):
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         with raw_parquet_localpath(sid) as path:
             names = set(pq.ParquetFile(path).schema_arrow.names)
         col = _REQUIRED_COL.get(sid)
