@@ -408,13 +408,20 @@ def _ts_family_sql(dep: str, dims: list) -> str:
     '''
 
 
-def _gdpbyindustry_sql(dep: str) -> str:
+def _gdpbyindustry_sql(dep: str, with_quarter: bool) -> str:
+    # GDPbyIndustry rows carry a Quarter column (annual rows leave it blank);
+    # UnderlyingGDPbyIndustry is annual-only and NEVER emits a Quarter key, so
+    # referencing it there would raise "column Quarter not found" (verified
+    # live 2026-06-14). Emit NULL for the quarter column in that case.
+    quarter_col = (
+        "CAST(Quarter AS VARCHAR)" if with_quarter else "CAST(NULL AS VARCHAR)"
+    )
     return f'''
         SELECT
             CAST(TableID AS VARCHAR)              AS table_id,
             CAST(Frequency AS VARCHAR)            AS frequency,
             TRY_CAST(Year AS INTEGER)             AS year,
-            CAST(Quarter AS VARCHAR)              AS quarter,
+            {quarter_col}                         AS quarter,
             CAST(Industry AS VARCHAR)             AS industry,
             CAST(IndustrYDescription AS VARCHAR)  AS industry_description,
             {_VAL}                                AS value,
@@ -492,7 +499,7 @@ def _sql_for(node_id: str) -> str:
     if ds == "IntlServSTA":
         return _ts_family_sql(node_id, [("Channel", "channel"), ("Destination", "destination"), ("Industry", "industry"), ("AreaOrCountry", "area_or_country")])
     if ds in ("GDPbyIndustry", "UnderlyingGDPbyIndustry"):
-        return _gdpbyindustry_sql(node_id)
+        return _gdpbyindustry_sql(node_id, with_quarter=(ds == "GDPbyIndustry"))
     if ds == "InputOutput":
         return _inputoutput_sql(node_id)
     if ds == "MNE":
