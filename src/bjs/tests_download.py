@@ -26,17 +26,25 @@ _MIN_ROWS = {
 _NCVS = {"bjs-gcuy-rt5g", "bjs-gkck-euys", "bjs-r4j4-fdwx", "bjs-ya4e-n9zp"}
 
 
+def _download_ids(spec_ids):
+    """`spec_ids` carries every spec that ran — both the `bjs-<resource>`
+    download nodes and the `bjs-<resource>-transform` leaves. Only the download
+    nodes write raw parquet; the transforms publish Delta tables. Restrict the
+    raw-asset invariants to the download ids."""
+    return [s for s in spec_ids if not s.endswith("-transform")]
+
+
 def test_all_raw_assets_nonempty(spec_ids):
-    """Every spec's raw parquet should hold rows; empty usually means the
-    endpoint switched shape or the resource id went stale (404)."""
-    for sid in spec_ids:
+    """Every download spec's raw parquet should hold rows; empty usually means
+    the endpoint switched shape or the resource id went stale (404)."""
+    for sid in _download_ids(spec_ids):
         n = len(load_raw_parquet(sid))
         assert n > 0, f"{sid}: raw parquet has 0 rows"
 
 
 def test_raw_assets_meet_min_rows(spec_ids):
     """Guard against silent truncation (the Socrata 1000-row default cap)."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         floor = _MIN_ROWS.get(sid, 1)
         n = len(load_raw_parquet(sid))
         assert n >= floor, f"{sid}: only {n} rows, expected >= {floor} (truncated?)"
@@ -45,7 +53,7 @@ def test_raw_assets_meet_min_rows(spec_ids):
 def test_expected_key_columns_present(spec_ids):
     """NCVS tables must carry `year`; NIBRS tables must carry `indicator_name` +
     `estimate` — the columns the transforms key on."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         names = set(load_raw_parquet(sid).schema.names)
         if sid in _NCVS:
             assert "year" in names, f"{sid}: missing 'year' column"
