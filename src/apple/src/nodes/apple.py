@@ -43,7 +43,11 @@ from subsets_utils import NodeSpec, SqlNodeSpec, get, save_raw_parquet, save_sta
 # --- fetch surface ---------------------------------------------------------
 
 BASE = "https://rss.marketingtools.apple.com/api/v2"
-LIMIT = 200  # server accepts arbitrary values; full charts top out well under this.
+# Max chart depth the server honours: limit=100 returns 200 OK; limit>=150 (incl.
+# the 200 the research notes claimed) returns HTTP 500 for every endpoint.
+# Verified by live probing 2026-06-14 — this was the root cause of the prior
+# all-500 run. 100 is the full chart depth Apple's RSS Generator exposes.
+LIMIT = 100
 
 # Curated set of major Apple storefronts (ISO 3166-1 alpha-2). Not every media is
 # served in every storefront — missing (country, feed) combos return 404 and are
