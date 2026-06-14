@@ -37,23 +37,21 @@ def test_all_raw_assets_nonempty(spec_ids):
         assert len(rows) > 0, f"{sid}: raw NDJSON has 0 rows"
 
 
-def test_obs_value_present_and_mostly_numeric(spec_ids):
-    """Every row must carry obs_value (mandatory SDMX measure), and the bulk of
-    values must parse as numbers — guards against column-shift / label bleed in
-    the code:label split."""
+def test_obs_value_present_and_populated(spec_ids):
+    """Every row must carry the obs_value column (mandatory SDMX measure) and the
+    bulk of sampled rows must have it populated — guards against an empty 200
+    body, a column-shift, or label bleed in the code:label split.
+
+    Note: obs_value is NOT required to be numeric. A handful of flows publish a
+    categorical measure there (CCRI risk bands like "Extremely High"), so a
+    numeric-fraction check would wrongly fail those flows; we only assert the
+    column is present and non-blank for most rows."""
     for sid in spec_ids:
         rows = list(_sample_rows(sid))
         assert rows, f"{sid}: no rows to check obs_value"
         assert all("obs_value" in r for r in rows), \
             f"{sid}: rows missing obs_value column"
-        numeric = 0
-        for r in rows:
-            v = r.get("obs_value", "")
-            try:
-                float(v)
-                numeric += 1
-            except (TypeError, ValueError):
-                pass
-        frac = numeric / len(rows)
+        populated = sum(1 for r in rows if str(r.get("obs_value", "")).strip())
+        frac = populated / len(rows)
         assert frac >= 0.8, \
-            f"{sid}: only {frac:.0%} of sampled obs_value are numeric (expected >=80%)"
+            f"{sid}: only {frac:.0%} of sampled obs_value are non-blank (expected >=80%)"

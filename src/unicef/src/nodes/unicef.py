@@ -21,8 +21,17 @@ SDMX-CSV 1.0 renders every coded cell as "CODE: Label" (e.g. "AFG: Afghanistan")
 and the header columns as "CODE:Concept name". We split each cell on the first
 ": " into a `<col>` code and a `<col>_label` label (empty when the cell carries
 no label, e.g. OBS_VALUE / TIME_PERIOD). Column sets differ per dataflow, so raw
-is written as NDJSON (gzip), one asset per flow, and the per-flow SQL transform
-casts OBS_VALUE to DOUBLE and drops non-numeric observations.
+is written as NDJSON (gzip), one asset per flow.
+
+OBS_VALUE is NOT always numeric. Most flows carry a numeric measure, but a few
+publish a categorical measure in OBS_VALUE — e.g. CCRI (Children's Climate and
+Environment Risk Index) stores risk bands like "Extremely High" / "High" there,
+with the numeric index tucked into OBS_FOOTNOTE. So the per-flow SQL transform
+keeps OBS_VALUE as its original text and ADDS an `obs_value_numeric` column
+(TRY_CAST to DOUBLE, NULL for categorical), dropping only rows whose OBS_VALUE
+is blank. This publishes every observation rather than silently nuking whole
+flows whose measure happens to be categorical (the prior numeric-only filter
+produced 0 rows for CCRI and failed the DAG).
 
 Volume: flows range from a few thousand obs (WT) to ~860k rows / 180MB (CME)
 to ~870MB (GLOBAL_DATAFLOW). The response is streamed and parsed incrementally
@@ -185,16 +194,19 @@ DOWNLOAD_SPECS: list[NodeSpec] = [
 ]
 
 # One published Delta table per dataflow. The SQL is uniform across flows: keep
-# every column, cast OBS_VALUE to DOUBLE, and drop rows whose observation value
-# is missing/non-numeric. OBS_VALUE is mandatory in every SDMX dataflow.
+# every column as-is, add a numeric cast of OBS_VALUE (NULL where the measure is
+# categorical, e.g. CCRI), and drop only rows whose OBS_VALUE is blank. OBS_VALUE
+# is mandatory in every SDMX dataflow, so a non-blank filter never empties a flow.
 TRANSFORM_SPECS: list[SqlNodeSpec] = [
     SqlNodeSpec(
         id=f"{s.id}-transform",
         deps=[s.id],
         sql=f'''
-            SELECT * REPLACE (TRY_CAST(obs_value AS DOUBLE) AS obs_value)
+            SELECT
+                *,
+                TRY_CAST(obs_value AS DOUBLE) AS obs_value_numeric
             FROM "{s.id}"
-            WHERE TRY_CAST(obs_value AS DOUBLE) IS NOT NULL
+            WHERE COALESCE(TRIM(obs_value), '') <> ''
         ''',
     )
     for s in DOWNLOAD_SPECS
