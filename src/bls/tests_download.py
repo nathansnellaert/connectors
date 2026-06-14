@@ -10,9 +10,18 @@ from subsets_utils import load_raw_parquet, load_raw_ndjson
 _LABSTAT_COLS = {"series_id", "year", "period", "value", "footnote_codes"}
 
 
+def _download_ids(spec_ids):
+    """Keep only download asset ids — drop the SqlNodeSpec '-transform' leaves.
+
+    The harness passes every spec that ran (downloads AND transforms) in
+    ``spec_ids``. Transforms publish Delta tables, not raw assets, so loading
+    them with load_raw_* would 404; these health checks only inspect raw."""
+    return [s for s in spec_ids if not s.endswith("-transform")]
+
+
 def test_all_raw_assets_nonempty(spec_ids):
     """Every survey's raw asset must hold rows. esbr is ndjson; the rest parquet."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         if sid == "bls-esbr":
             rows = load_raw_ndjson(sid)
             assert len(rows) > 0, f"{sid}: esbr ndjson has 0 indicators"
@@ -23,7 +32,7 @@ def test_all_raw_assets_nonempty(spec_ids):
 
 def test_labstat_schema(spec_ids):
     """LABSTAT parquet must carry the documented 5-column observation layout."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         if sid == "bls-esbr":
             continue
         table = load_raw_parquet(sid)
