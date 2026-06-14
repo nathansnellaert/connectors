@@ -29,6 +29,7 @@ never materialised in memory.
 
 import csv
 import io
+import re
 import time
 import zipfile
 
@@ -125,6 +126,36 @@ def _entity_id(node_id: str) -> str:
     return node_id[len("bis-"):].upper().replace("-", "_")
 
 
+_COL_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*:")
+
+
+def _column_codes(header_fields: list[str]) -> list[str]:
+    """Reconstruct SDMX-CSV column codes from a bulk-flat header row.
+
+    BIS bulk headers are ``CODE:Label`` per column, except the first three
+    bare columns ``STRUCTURE``, ``STRUCTURE_ID``, ``ACTION``. The labels are
+    NOT quoted, and some contain commas — e.g. WS_NA_SEC_DSS carries
+    ``STO:Stocks, Transactions, Other Flows`` and
+    ``EXPENDITURE:Expenditure (COFOG, COICOP, COPP or COPNI)``. A CSV split of
+    such a header over-segments it into more fields than the (properly quoted)
+    data rows have, so a naive ``code = field.split(":")[0]`` inflates the
+    column count and every data row is then dropped on the width check.
+
+    Real columns are: the first three bare ones, then every fragment that opens
+    a new ``CODE:`` token. Comma-split label fragments (" Transactions",
+    " COICOP", ...) lack that pattern and are merged away. The caller asserts
+    the reconstructed count equals the data-row field count, so a genuine
+    format change still surfaces loudly instead of silently dropping rows.
+    """
+    codes: list[str] = []
+    for i, field in enumerate(header_fields):
+        if i < 3:
+            codes.append(field.strip())
+        elif _COL_CODE_RE.match(field):
+            codes.append(field.split(":", 1)[0].strip())
+    return codes
+
+
 def _mark_skipped(asset: str, eid: str, reason: str) -> None:
     state = load_state(asset)
     skipped = state.get("skipped", {})
@@ -161,8 +192,9 @@ def fetch_one(node_id: str) -> None:
         text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
         reader = csv.reader(text)
         header = next(reader)
-        # SDMX bulk headers are "CODE:Label" — keep just the code as the column.
-        keys = [h.split(":", 1)[0].strip() for h in header]
+        # SDMX bulk headers are "CODE:Label"; some labels carry unquoted commas,
+        # so reconstruct the real column codes rather than splitting blindly.
+        keys = _column_codes(header)
         if len(set(keys)) != len(keys):
             raise AssertionError(f"{asset}: duplicate column codes in header {keys}")
         try:
@@ -175,6 +207,7 @@ def fetch_one(node_id: str) -> None:
         schema = pa.schema([(k, pa.string()) for k in keys])
 
         n = 0
+        skipped_width = 0
         cols: list[list] = [[] for _ in range(ncols)]
         with raw_parquet_writer(asset, schema, compression="zstd") as writer:
             def _flush() -> None:
@@ -189,7 +222,8 @@ def fetch_one(node_id: str) -> None:
 
             for row in reader:
                 if len(row) != ncols:
-                    continue  # malformed line
+                    skipped_width += 1  # width drift vs reconstructed header
+                    continue
                 if not row[obs_idx]:
                     continue  # series-definition row with no observation
                 for i in range(ncols):
@@ -205,6 +239,14 @@ def fetch_one(node_id: str) -> None:
     if n == 0:
         raise AssertionError(
             f"{asset}: zip {url} yielded 0 observations — format may have changed"
+        )
+    # A few stray malformed lines are tolerable; a width mismatch that drops more
+    # rows than it keeps means the reconstructed header no longer aligns to the
+    # data — surface it rather than publish a silently-truncated table.
+    if skipped_width > n:
+        raise AssertionError(
+            f"{asset}: {skipped_width} rows dropped on width mismatch vs "
+            f"{n} kept ({ncols} cols expected) — header/data layout drifted"
         )
 
     print(f"{asset}: wrote {n} observations from {url}", flush=True)
