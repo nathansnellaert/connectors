@@ -4,27 +4,35 @@ WATER  (9 entities): USGS Water Data OGC API Features
     https://api.waterdata.usgs.gov/ogcapi/v0/collections/<id>/items
     Each collection is a GeoJSON FeatureCollection paged via a cursor `next`
     link. The observation collections (continuous, daily, ...) are effectively
-    unbounded and ever-growing, so each fetch is a *bounded* cursor crawl that
-    resumes from a stored cursor and writes one NDJSON batch per page
-    (firehose shape). Properties differ per collection and are full of nullable
-    fields, so raw is NDJSON (drift-tolerant); the transform re-types per
-    collection.
+    unbounded (billions of observations) and there is no whole-corpus bulk dump
+    nor a stable monotonic key we can resume against (the cursor is opaque), so
+    a full re-pull is infeasible and a resumable watermark is not well-defined.
+    We therefore publish a *bounded rolling snapshot*: a deterministic crawl of
+    the first WATER_MAX_PAGES pages from the start of each collection, one
+    NDJSON batch per page. Re-running overwrites the same batch files
+    (idempotent). Properties differ per collection and are full of nullable /
+    occasionally-nested fields, so raw is NDJSON (drift-tolerant) with non-scalar
+    property values JSON-encoded to keep every column SQL-readable; the transform
+    re-types per collection.
 
 EARTHQUAKES (1 entity, `events`): USGS ComCat via the FDSN Event service
     https://earthquake.usgs.gov/fdsnws/event/1/query  (chosen mechanism)
     Full catalog is millions of events back to ~1900; a single query is capped
-    at 20000 events. We window by time (30-day windows, offset-paged) and keep
-    a two-pointer watermark: a forward pointer (refresh recent/new events on
-    every run) and a backward pointer (progressively backfill history). CSV is
-    the flattest format; we parse it to dicts and store NDJSON batches.
+    at 20000 events. There is no bulk dump, so we publish a bounded rolling
+    snapshot of the last EQ_MONTHS_BACK calendar months (all magnitudes), one
+    NDJSON batch per month, each window offset-paged under the 20000 cap. CSV is
+    the flattest format; we parse it to dicts. Re-running overwrites the same
+    month batches (idempotent); the current partial month refreshes each run.
 
 Freshness gating is the maintain step's job — these fns always fetch when run.
+Both surfaces are stateless full-snapshot crawls: no watermark, no cursor
+persistence, no terminal flags. Robust under the harness's parallel spawn
+execution and trivially idempotent.
 """
 
 import csv
 import io
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -40,12 +48,7 @@ from subsets_utils import (
     SqlNodeSpec,
     get,
     save_raw_ndjson,
-    load_state,
-    save_state,
 )
-
-# Bump when the shape of persisted state changes (cursor / watermark keys).
-STATE_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Entity union (authoritative — copied from entity_union.json). `events` is the
@@ -66,7 +69,9 @@ ENTITY_IDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# HTTP transport — retried, timed out, honest error classification.
+# HTTP transport — retried, timed out, honest error classification. Research
+# notes the water API answers excessive use with 403/429, so 403 is treated as
+# a transient rate-limit signal (back off and retry); other 4xx stay permanent.
 # ---------------------------------------------------------------------------
 _TRANSIENT_EXC = (
     httpx.ConnectError,
@@ -84,13 +89,13 @@ def _is_transient(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
-        return code == 429 or 500 <= code < 600
+        return code in (403, 429) or 500 <= code < 600
     return False
 
 
 @retry(
     retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(6),
+    stop=stop_after_attempt(7),
     wait=wait_exponential(min=4, max=120),
     reraise=True,
 )
@@ -101,12 +106,11 @@ def _http_get(url: str, params: dict) -> httpx.Response:
 
 
 # ===========================================================================
-# WATER — cursor-paged OGC API Features crawl (firehose, NDJSON batches)
+# WATER — cursor-paged OGC API Features crawl (bounded snapshot, NDJSON batches)
 # ===========================================================================
 WATER_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0/collections"
 WATER_PAGE_LIMIT = 5000        # features per page (API allows up to 20000)
-WATER_MAX_PAGES_PER_RUN = 6    # soft per-run cap — deliberate pacing
-WATER_MAX_RUN_SECONDS = 600    # soft wall-clock cap per run
+WATER_MAX_PAGES = 6            # bounded snapshot depth — see module docstring
 
 
 def _extract_cursor(href: str) -> str | None:
@@ -116,9 +120,18 @@ def _extract_cursor(href: str) -> str | None:
     return vals[0] if vals else None
 
 
+def _scalarize(value):
+    """Keep scalars; JSON-encode dict/list values so every NDJSON column stays a
+    flat, uniformly-typed scalar that DuckDB's read_json can union cleanly."""
+    if isinstance(value, (dict, list)):
+        import json
+        return json.dumps(value, separators=(",", ":"))
+    return value
+
+
 def _flatten_feature(feature: dict) -> dict:
     """One GeoJSON feature -> a flat dict: properties + geometry lon/lat."""
-    props = dict(feature.get("properties") or {})
+    props = {k: _scalarize(v) for k, v in (feature.get("properties") or {}).items()}
     geom = feature.get("geometry") or {}
     lon = lat = None
     if isinstance(geom, dict):
@@ -128,7 +141,7 @@ def _flatten_feature(feature: dict) -> dict:
     props["_geometry_lon"] = lon
     props["_geometry_lat"] = lat
     if "id" not in props:
-        # observation collections (continuous/daily) carry id at feature level
+        # observation collections carry their id at the feature level
         props["_feature_id"] = feature.get("id")
     return props
 
@@ -138,71 +151,69 @@ def fetch_water(node_id: str) -> None:
     entity = node_id[len("usgs-"):]
     items_url = f"{WATER_BASE}/{entity}/items"
 
-    state = load_state(asset)
-    if state.get("schema_version") != STATE_VERSION:
-        state = {"schema_version": STATE_VERSION, "cursor": None, "batch_seq": 0}
-
-    cursor = state.get("cursor")
-    seq = state.get("batch_seq", 0)
-    deadline = time.monotonic() + WATER_MAX_RUN_SECONDS
-    pages = 0
+    cursor = None
     total = 0
-
-    while pages < WATER_MAX_PAGES_PER_RUN and time.monotonic() < deadline:
+    for seq in range(WATER_MAX_PAGES):
         params = {"f": "json", "limit": WATER_PAGE_LIMIT}
         if cursor:
             params["cursor"] = cursor
         payload = _http_get(items_url, params).json()
         feats = payload.get("features") or []
         if not feats:
-            # crawl exhausted — restart from the beginning on the next run so
-            # the snapshot refreshes (batch_seq reset overwrites prior batches).
-            state.update({"cursor": None, "batch_seq": 0})
-            save_state(asset, state)
-            break
+            break                            # collection exhausted before the cap
 
         rows = [_flatten_feature(ft) for ft in feats]
-        save_raw_ndjson(rows, f"{asset}-{seq:06d}")   # raw FIRST
+        save_raw_ndjson(rows, f"{asset}-{seq:06d}")   # raw write per page
         total += len(rows)
-        seq += 1
-        pages += 1
+        print(f"[{asset}] page {seq + 1}/{WATER_MAX_PAGES}, {total} rows", flush=True)
 
         nxt = next(
             (l.get("href") for l in payload.get("links", []) if l.get("rel") == "next"),
             None,
         )
         cursor = _extract_cursor(nxt)
-        state.update({"cursor": cursor, "batch_seq": seq})
-        save_state(asset, state)                       # then state
-
-        if pages % 5 == 0:
-            print(f"[{asset}] {pages} pages, {total} rows", flush=True)
         if cursor is None:
-            # reached the last page exactly — restart next run.
-            state.update({"cursor": None, "batch_seq": 0})
-            save_state(asset, state)
-            break
+            break                            # reached the last page exactly
 
-    state["last_run_stats"] = {"records": total, "pages": pages}
-    save_state(asset, state)
-    print(f"[{asset}] done: {pages} pages, {total} rows", flush=True)
+    if total == 0:
+        # A collection that returns zero features on its very first page is a
+        # real upstream change, not normal — surface it loudly.
+        raise RuntimeError(f"{asset}: water collection returned no features")
+    print(f"[{asset}] done: {total} rows", flush=True)
 
 
 # ===========================================================================
-# EARTHQUAKES — time-windowed FDSN crawl (firehose, NDJSON batches)
+# EARTHQUAKES — month-windowed FDSN crawl (bounded snapshot, NDJSON batches)
 # ===========================================================================
 FDSN_QUERY = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 FDSN_PAGE = 20000                       # hard per-query cap of the service
-FDSN_OFFSET_CAP = 2_000_000             # safety: a 30-day window exceeding this
-EQ_WINDOW = timedelta(days=30)
-EQ_OVERLAP = timedelta(days=2)          # re-fetch a little on forward refresh
-EQ_SOURCE_MIN = datetime(1900, 1, 1, tzinfo=timezone.utc)
-EQ_MAX_BACKFILL_WINDOWS = 4             # soft per-run backfill cap
-EQ_MAX_RUN_SECONDS = 600
+FDSN_OFFSET_CAP = 200_000               # safety: a single month exceeding this
+EQ_MONTHS_BACK = 24                     # bounded snapshot horizon (months)
 
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _month_windows(now: datetime, months_back: int):
+    """Yield (label, start, end) calendar-month windows, oldest first, covering
+    the trailing `months_back` months up to `now` (the final window is partial)."""
+    y, m = now.year, now.month
+    starts = []
+    for _ in range(months_back):
+        starts.append((y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    starts.reverse()
+    for i, (yy, mm) in enumerate(starts):
+        start = datetime(yy, mm, 1, tzinfo=timezone.utc)
+        if i + 1 < len(starts):
+            ny, nm = starts[i + 1]
+            end = datetime(ny, nm, 1, tzinfo=timezone.utc)
+        else:
+            end = now
+        yield f"{yy:04d}-{mm:02d}", start, end
 
 
 def _query_events(start: datetime, end: datetime) -> list[dict]:
@@ -239,59 +250,19 @@ def _query_events(start: datetime, end: datetime) -> list[dict]:
     return rows
 
 
-def _save_event_batch(node_id: str, start: datetime, end: datetime, rows: list[dict]) -> None:
-    batch_key = f"{start.date().isoformat()}-{end.date().isoformat()}"
-    save_raw_ndjson(rows, f"{node_id}-{batch_key}")
-
-
 def fetch_earthquakes(node_id: str) -> None:
     asset = node_id
-    state = load_state(asset)
-    if state.get("schema_version") != STATE_VERSION:
-        state = {"schema_version": STATE_VERSION}
-
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    deadline = time.monotonic() + EQ_MAX_RUN_SECONDS
     total = 0
-
-    # --- forward: refresh recent / newly-arrived events every run ---
-    newest = state.get("newest_seen")
-    fwd_start = (
-        datetime.fromisoformat(newest) - EQ_OVERLAP if newest else now - EQ_WINDOW
-    )
-    rows = _query_events(fwd_start, now)
-    if rows:
-        _save_event_batch(node_id, fwd_start, now, rows)   # raw FIRST
-        total += len(rows)
-    state["newest_seen"] = now.isoformat()
-    save_state(asset, state)
-
-    # --- backfill: march the history pointer backward toward SOURCE_MIN ---
-    frontier = (
-        datetime.fromisoformat(state["oldest_start"])
-        if state.get("oldest_start")
-        else fwd_start
-    )
-    windows = 0
-    while (
-        frontier > EQ_SOURCE_MIN
-        and windows < EQ_MAX_BACKFILL_WINDOWS
-        and time.monotonic() < deadline
-    ):
-        w_start = max(frontier - EQ_WINDOW, EQ_SOURCE_MIN)
-        rows = _query_events(w_start, frontier)
+    for label, start, end in _month_windows(now, EQ_MONTHS_BACK):
+        rows = _query_events(start, end)
         if rows:
-            _save_event_batch(node_id, w_start, frontier, rows)  # raw FIRST
+            save_raw_ndjson(rows, f"{asset}-{label}")   # one batch per month
             total += len(rows)
-        frontier = w_start
-        state["oldest_start"] = frontier.isoformat()
-        save_state(asset, state)                                  # then state
-        windows += 1
-        print(f"[{asset}] backfilled to {frontier.date()}, {total} rows", flush=True)
-
-    state["last_run_stats"] = {"records": total}
-    save_state(asset, state)
-    print(f"[{asset}] done: {total} rows", flush=True)
+        print(f"[{asset}] {label}: {len(rows)} events ({total} total)", flush=True)
+    if total == 0:
+        raise RuntimeError(f"{asset}: FDSN returned no events for the snapshot window")
+    print(f"[{asset}] done: {total} events", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +371,7 @@ _TRANSFORM_SQL = {
         FROM "{dep}"
         WHERE field_measurements_series_id IS NOT NULL
         QUALIFY row_number() OVER (
-            PARTITION BY field_measurements_series_id, parameter_code
+            PARTITION BY field_measurements_series_id, parameter_code, "time"
             ORDER BY TRY_CAST(last_modified AS TIMESTAMP) DESC NULLS LAST
         ) = 1
     ''',
