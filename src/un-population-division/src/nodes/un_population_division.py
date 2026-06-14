@@ -4,25 +4,30 @@ Mechanism: bulk_csv. The WPP 2024 "Standard projections" CSV export publishes
 gzipped CSV files (one full table per request, no auth, no pagination) under
   https://population.un.org/wpp/assets/Excel%20Files/1_Indicator%20(Standard)/CSV_FILES/
 
-Each entity in the union maps to one or more of these files. We download the
-gzip bytes and store them verbatim as `*.csv.gz` raw assets — DuckDB reads
-`.csv.gz` natively, so the SQL transforms do all parsing/typing. No incremental
-support exists on this source (research handoff); WPP revisions land ~biennially
-and bake the revision year into the file name (WPP2024_), so a new revision means
-updating the file names below. Re-fetch is a full pull each refresh.
+Each entity in the union maps to one or more of these files. We stream the gzip
+through pyarrow's CSV reader (which honours the `"`-quoted Location values that
+contain commas — DuckDB's auto-CSV quote detection does not, reliably) and write
+a typed Parquet raw asset. Column types are pinned from the header so multi-file
+assets and re-runs share an identical schema. The SQL transforms then cast/rename
+to a clean published shape.
 
-Scoping decisions (documented; the same mechanism exposes the rest if needed):
+No incremental support exists on this source (research handoff); WPP revisions
+land ~biennially and bake the revision year into the file name (WPP2024_), so a
+new revision means updating the file names in SOURCES. Re-fetch is a full pull
+each refresh; freshness gating is the maintain step's job.
+
+Scoping decisions (the same mechanism exposes the rest if ever needed):
   * demographic-indicators — Medium + OtherVariants (full variant coverage).
   * fertility-by-age       — 5-year age groups (Age5). Single-year (Age1) is
                              ~300MB gz and omitted.
   * life-tables            — Abridged Medium, both time spans (1950-2023 +
-                             2024-2100). Complete life tables not published as CSV.
+                             2024-2100). Complete life tables aren't published as CSV.
   * migration              — net migration count/rate columns of the Demographic
                              Indicators (Medium) file; WPP ships no dedicated
                              migration CSV.
   * population-by-age-sex  — 5-year age groups, Medium, both 1-January and 1-July
-                             reference dates (distinguished by an appended RefDate
-                             column). Single-year-of-age files (~62MB gz each) and
+                             reference dates (kept apart by an injected RefDate
+                             column). Single-year-of-age (~62MB gz each) and
                              OtherVariants (~231MB gz) are omitted.
 """
 
@@ -31,6 +36,8 @@ from __future__ import annotations
 import zlib
 
 import httpx
+import pyarrow as pa
+import pyarrow.csv as pacsv
 from tenacity import (
     retry,
     retry_if_exception,
@@ -38,41 +45,47 @@ from tenacity import (
     wait_exponential,
 )
 
-from subsets_utils import NodeSpec, SqlNodeSpec, get, raw_writer, save_raw_file
+from subsets_utils import NodeSpec, SqlNodeSpec, get, raw_parquet_writer
 
 BASE = (
     "https://population.un.org/wpp/assets/Excel%20Files/"
     "1_Indicator%20(Standard)/CSV_FILES/"
 )
 
-# spec id -> list of (filename, batch_key). Stored verbatim as <id>-<key>.csv.gz.
-FILES: dict[str, list[tuple[str, str]]] = {
+# spec id -> list of (filename, refdate). refdate is None for files that don't
+# need a reference-date marker; for population it tags 1-Jan vs 1-July rows so
+# they stay distinct after the two files are unioned.
+SOURCES: dict[str, list[tuple[str, str | None]]] = {
     "un-population-division-demographic-indicators": [
-        ("WPP2024_Demographic_Indicators_Medium.csv.gz", "medium"),
-        ("WPP2024_Demographic_Indicators_OtherVariants.csv.gz", "othervariants"),
+        ("WPP2024_Demographic_Indicators_Medium.csv.gz", None),
+        ("WPP2024_Demographic_Indicators_OtherVariants.csv.gz", None),
     ],
     "un-population-division-fertility-by-age": [
-        ("WPP2024_Fertility_by_Age5.csv.gz", "age5"),
+        ("WPP2024_Fertility_by_Age5.csv.gz", None),
     ],
     "un-population-division-life-tables": [
-        ("WPP2024_Life_Table_Abridged_Medium_1950-2023.csv.gz", "abridged-1950"),
-        ("WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz", "abridged-2024"),
+        ("WPP2024_Life_Table_Abridged_Medium_1950-2023.csv.gz", None),
+        ("WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz", None),
     ],
     "un-population-division-migration": [
-        ("WPP2024_Demographic_Indicators_Medium.csv.gz", "medium"),
+        ("WPP2024_Demographic_Indicators_Medium.csv.gz", None),
     ],
-}
-
-# Population needs a RefDate column injected to distinguish 1-Jan from 1-July
-# rows once DuckDB unions the two files. spec id -> (filename, refdate, batch_key).
-POPULATION_FILES: dict[str, list[tuple[str, str, str]]] = {
     "un-population-division-population-by-age-sex": [
-        ("WPP2024_PopulationByAge5GroupSex_Medium.csv.gz", "1July", "july"),
-        ("WPP2024_Population1JanuaryByAge5GroupSex_Medium.csv.gz", "1January", "jan"),
+        ("WPP2024_PopulationByAge5GroupSex_Medium.csv.gz", "1July"),
+        ("WPP2024_Population1JanuaryByAge5GroupSex_Medium.csv.gz", "1January"),
     ],
 }
 
-_CHUNK = 1 << 20  # 1 MiB of compressed bytes fed to the decompressor at a time
+# Column-name -> pinned arrow type. Anything not listed is a numeric measure and
+# is read as float64, so the schema is identical across files and reruns.
+_STRING_COLS = {
+    "Notes", "ISO3_code", "ISO2_code", "SDMX_code", "LocTypeName",
+    "Location", "Variant", "Sex", "AgeGrp", "RefDate",
+}
+_INT_COLS = {
+    "SortOrder", "LocID", "LocTypeID", "ParentID", "VarID", "Time",
+    "SexID", "AgeGrpStart", "AgeGrpSpan",
+}
 
 _TRANSIENT_EXC = (
     httpx.ConnectError,
@@ -107,68 +120,103 @@ def _fetch_bytes(url: str) -> bytes:
     return resp.content
 
 
-def fetch_simple(node_id: str) -> None:
-    """Download each WPP gzip for this entity and store it verbatim as csv.gz."""
+def _header_cols(content: bytes) -> list[str]:
+    """Decompress just enough of the gzip to read the CSV header row."""
+    dec = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    prefix = dec.decompress(content[:65536])
+    line = prefix.split(b"\n", 1)[0].decode("utf-8-sig").rstrip("\r")
+    return line.split(",")
+
+
+def _column_types(cols: list[str]) -> dict[str, pa.DataType]:
+    types: dict[str, pa.DataType] = {}
+    for c in cols:
+        if c in _STRING_COLS:
+            types[c] = pa.string()
+        elif c in _INT_COLS:
+            types[c] = pa.int64()
+        else:
+            types[c] = pa.float64()
+    return types
+
+
+def _dedup_names(names: list[str]) -> list[str]:
+    """Rename case-insensitive duplicate columns (WPP life tables have both
+    `lx` and `Lx`) the same way DuckDB would: append `_1`, `_2`, ... to the
+    later collision so each column is addressable in SQL."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for n in names:
+        low = n.lower()
+        if low in seen:
+            seen[low] += 1
+            out.append(f"{n}_{seen[low]}")
+        else:
+            seen[low] = 0
+            out.append(n)
+    return out
+
+
+def _iter_tables(sources: list[tuple[str, str | None]]):
+    """Yield pyarrow Tables (one per CSV block) across all source files of an
+    asset, with columns deduped and an optional RefDate column appended."""
+    base_names: list[str] | None = None
+    for filename, refdate in sources:
+        content = _fetch_bytes(BASE + filename)
+        col_types = _column_types(_header_cols(content))
+        src = pa.input_stream(pa.py_buffer(content), compression="gzip")
+        reader = pacsv.open_csv(
+            src,
+            read_options=pacsv.ReadOptions(block_size=8 << 20),
+            convert_options=pacsv.ConvertOptions(
+                column_types=col_types,
+                strings_can_be_null=True,
+                null_values=[""],
+            ),
+        )
+        names = _dedup_names([f.name for f in reader.schema])
+        if base_names is None:
+            base_names = names
+        elif names != base_names:
+            raise ValueError(
+                f"column mismatch in {filename}: {names} != {base_names}"
+            )
+        for batch in reader:
+            tbl = pa.Table.from_batches([batch.rename_columns(names)])
+            if refdate is not None:
+                tbl = tbl.append_column(
+                    "RefDate", pa.array([refdate] * tbl.num_rows, type=pa.string())
+                )
+            yield tbl
+        print(f"  parsed {filename}", flush=True)
+
+
+def fetch_one(node_id: str) -> None:
+    """Stream every WPP CSV for this entity into one typed Parquet raw asset."""
+    gen = _iter_tables(SOURCES[node_id])
+    try:
+        first = next(gen)
+    except StopIteration:
+        raise ValueError(f"{node_id}: no rows parsed from source files")
+    out_schema = first.schema
     total = 0
-    for filename, key in FILES[node_id]:
-        url = BASE + filename
-        content = _fetch_bytes(url)
-        asset = f"{node_id}-{key}"
-        save_raw_file(content, asset, extension="csv.gz")
-        total += len(content)
-        print(f"[{node_id}] saved {asset}.csv.gz <- {filename} ({len(content)} bytes)", flush=True)
-    print(f"[{node_id}] done, {total} compressed bytes", flush=True)
-
-
-def fetch_population(node_id: str) -> None:
-    """Like fetch_simple, but append a RefDate column so 1-Jan and 1-July rows
-    stay distinguishable after DuckDB unions the two files. Streaming line work
-    keeps memory bounded; appending at end-of-line is safe regardless of any
-    quoted commas inside Location values."""
-    for filename, refdate, key in POPULATION_FILES[node_id]:
-        url = BASE + filename
-        content = _fetch_bytes(url)
-        asset = f"{node_id}-{key}"
-        tag = ("," + refdate + "\n").encode("utf-8")
-        dec = zlib.decompressobj(zlib.MAX_WBITS | 16)
-        n_rows = 0
-        with raw_writer(asset, "csv.gz", mode="wb", compression="gzip") as out:
-            buf = b""
-            header_done = False
-            for i in range(0, len(content), _CHUNK):
-                buf += dec.decompress(content[i : i + _CHUNK])
-                lines = buf.split(b"\n")
-                buf = lines.pop()  # trailing partial line carries to next chunk
-                for ln in lines:
-                    ln = ln.rstrip(b"\r")
-                    if not header_done:
-                        out.write(ln + b",RefDate\n")
-                        header_done = True
-                        continue
-                    if not ln:
-                        continue
-                    out.write(ln + tag)
-                    n_rows += 1
-            buf += dec.flush()
-            buf = buf.rstrip(b"\r\n")
-            if buf:
-                out.write(buf + tag)
-                n_rows += 1
-        print(f"[{node_id}] saved {asset}.csv.gz <- {filename} ({n_rows} rows)", flush=True)
+    with raw_parquet_writer(node_id, out_schema) as writer:
+        writer.write_table(first)
+        total += first.num_rows
+        for tbl in gen:
+            writer.write_table(tbl.cast(out_schema))
+            total += tbl.num_rows
+    print(f"[{node_id}] wrote {total} rows", flush=True)
 
 
 DOWNLOAD_SPECS = [
-    NodeSpec(id="un-population-division-demographic-indicators", fn=fetch_simple, kind="download"),
-    NodeSpec(id="un-population-division-fertility-by-age", fn=fetch_simple, kind="download"),
-    NodeSpec(id="un-population-division-life-tables", fn=fetch_simple, kind="download"),
-    NodeSpec(id="un-population-division-migration", fn=fetch_simple, kind="download"),
-    NodeSpec(id="un-population-division-population-by-age-sex", fn=fetch_population, kind="download"),
+    NodeSpec(id=node_id, fn=fetch_one, kind="download") for node_id in SOURCES
 ]
 
 
 # ---------------------------------------------------------------------------
-# Transforms — one published Delta table per subset. The SQL is the parse/type
-# gate; DuckDB infers types from the csv.gz and we cast/rename to a clean shape.
+# Transforms — one published Delta table per subset. Raw is already typed
+# Parquet; the SQL casts/renames to a clean published shape and drops null keys.
 # ---------------------------------------------------------------------------
 
 _DEMOGRAPHIC_SQL = '''
@@ -201,8 +249,7 @@ _FERTILITY_SQL = '''
     WHERE LocID IS NOT NULL AND Time IS NOT NULL AND AgeGrp IS NOT NULL
 '''
 
-# DuckDB de-dups the case-insensitive collision lx/Lx by renaming the second
-# (Lx) to Lx_1; the lowercase lx keeps its name.
+# `Lx` was renamed to `Lx_1` by _dedup_names (it collides with `lx`).
 _LIFE_TABLES_SQL = '''
     SELECT
         CAST(LocID AS BIGINT)        AS location_id,
