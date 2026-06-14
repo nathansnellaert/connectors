@@ -8,8 +8,13 @@ from subsets_utils import load_raw_parquet
 
 def test_all_raw_assets_nonempty(spec_ids):
     """Every download spec's raw parquet must hold rows — an empty payload means
-    the bulk file moved, changed format, or the melt produced nothing."""
-    for sid in spec_ids:
+    the bulk file moved, changed format, or the melt produced nothing.
+
+    spec_ids may also carry the transform (leaf) ids, which publish Delta tables
+    rather than raw parquet, so only the actual download assets are loaded here."""
+    download_ids = [s for s in spec_ids if not s.endswith("-transform")]
+    assert download_ids, f"no download spec ids in {spec_ids}"
+    for sid in download_ids:
         table = load_raw_parquet(sid)
         assert len(table) > 0, f"{sid}: raw parquet has 0 rows"
 
