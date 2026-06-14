@@ -12,6 +12,11 @@ param is unreliable on this server — it returns an EMPTY 200 body for large
 dataflows (e.g. CME) while the Accept header returns the full table. So we
 pin the Accept header, never the format param.
 
+Version: the flow ref omits the version (`data/UNICEF,<FLOW>/all`) so SDMX
+resolves the latest published version automatically. Probed and verified 200
+for every flow including SDG_PROG_ASSESSMENT (which is on 1.1, not 1.0) — this
+avoids a 404 whenever a flow's version is bumped upstream.
+
 SDMX-CSV 1.0 renders every coded cell as "CODE: Label" (e.g. "AFG: Afghanistan")
 and the header columns as "CODE:Concept name". We split each cell on the first
 ": " into a `<col>` code and a `<col>_label` label (empty when the cell carries
@@ -61,10 +66,6 @@ ENTITY_IDS = [
     "WASH_HEALTHCARE_FACILITY", "WASH_HOUSEHOLDS", "WASH_HOUSEHOLD_MH",
     "WASH_SCHOOLS", "WT",
 ]
-
-# Dataflow version per entity (from collect source_metadata). Default "1.0";
-# only the exceptions are listed.
-VERSIONS = {"SDG_PROG_ASSESSMENT": "1.1"}
 
 _TRANSIENT_EXC = (
     httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
