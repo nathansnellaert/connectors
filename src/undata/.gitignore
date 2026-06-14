@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Data — generated locally, never committed.
+data/
+log/
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
