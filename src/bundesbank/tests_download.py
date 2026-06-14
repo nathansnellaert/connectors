@@ -8,10 +8,16 @@ floats (which would mean the wide-CSV melt drifted).
 from subsets_utils import load_raw_parquet
 
 
+def _download_ids(spec_ids):
+    """spec_ids carries every spec that ran — downloads AND the `-transform`
+    leaves. Only downloads write raw parquet, so filter the transforms out."""
+    return [s for s in spec_ids if not s.endswith("-transform")]
+
+
 def test_all_raw_assets_nonempty(spec_ids):
     """Every dataflow's raw parquet should hold observations. An empty asset
     usually means the csv-zip endpoint changed shape or returned only metadata."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         table = load_raw_parquet(sid)
         assert len(table) > 0, f"{sid}: raw parquet has 0 rows"
 
@@ -19,7 +25,7 @@ def test_all_raw_assets_nonempty(spec_ids):
 def test_schema_and_values(spec_ids):
     """Columns, types, and no-null guarantees on the melted long table."""
     expected = {"dataflow_id", "series_key", "time_period", "value", "flag"}
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         table = load_raw_parquet(sid)
         assert expected.issubset(set(table.column_names)), (
             f"{sid}: missing columns, got {table.column_names}"
