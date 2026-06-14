@@ -95,7 +95,12 @@ def _configure_token() -> None:
     works unauthenticated. ASCII-only header value."""
     token = os.environ.get("SOCRATA_APP_TOKEN")
     if token:
-        configure_http(headers={"X-App-Token": token})
+        # Preserve the default User-Agent (configure_http replaces the whole
+        # headers dict) while adding the token. ASCII-only values.
+        configure_http(headers={
+            "User-Agent": os.environ.get("HTTP_USER_AGENT", "DataIntegrations/1.0"),
+            "X-App-Token": token,
+        })
 
 
 @retry(
