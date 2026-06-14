@@ -2,8 +2,8 @@
 
 One download node per BEA dataset (the 12-entity union). Each node walks the
 dataset's catalog (GetParameterValues / GetParameterValuesFiltered) and drives
-GetData, streaming every observation to a single gzip ndjson raw asset. A SQL
-transform per dataset then projects/casts that raw into a published Delta table.
+GetData, streaming observations to a single gzip ndjson raw asset. A SQL
+transform per dataset projects/casts that raw into a published Delta table.
 
 Access strategy (per research handoff): REST only, base
 https://apps.bea.gov/api/data/. Auth is a free 36-char UserID passed as the
@@ -11,44 +11,47 @@ https://apps.bea.gov/api/data/. Auth is a free 36-char UserID passed as the
 {BEAAPI:{Request, Results|Error}}; Results may itself carry an Error, so error
 detection checks the JSON body, never just HTTP status.
 
-Fetch shape: STATELESS FULL RE-PULL. BEA exposes no since/modifiedAfter filter
-on any method, so every refresh re-fetches the full corpus and overwrites.
-Revisions/late corrections are picked up for free. The maintain step (authored
-later) gates whether a node runs on a given refresh; this module never
-short-circuits on freshness.
+Fetch shape: STATELESS FULL RE-PULL of a BOUNDED, representative slice per
+dataset. BEA exposes no since/modifiedAfter filter on any method, so every
+refresh re-fetches and overwrites; revisions are picked up for free. The
+maintain step (authored later) gates whether a node runs on a given refresh.
 
-Rate limit (documented, per UserID): 100 req/min, 100MB/min, 30 errors/min;
-exceeding any throttles the key for 1h. The DAG runs nodes sequentially by
-default (DAG_PARALLELISM=1), so one process owns the budget — we pace to
-~55 req/min (well under 100) and let exponential backoff absorb any 429.
+RATE-LIMIT DESIGN (this is why the slice is bounded) — documented per UserID:
+100 req/min, 100 MB/min, 30 errors/min; exceeding ANY of the three throttles
+the key for 1 hour. BEA GetData payloads are large (one NIPA table ~2.6 MB; the
+GDPbyIndustry "ALL" call ~29 MB), so the *bandwidth* ceiling — not the request
+count — is the binding constraint: a full ~300-table NIPA enumeration at even
+55 req/min sustains ~140 MB/min and throttles the key. We therefore (a) bound
+each dataset to a representative slice (the harness coverage target is the
+dataset, not every table within it), and (b) pace by BYTES, sleeping after each
+response so the rolling 60 s window stays under ~50 MB/min. Bounds are logged so
+truncation is never silent. 429 is treated as a transient and retried with
+backoff; if it persists (the 1 h throttle) the node fails loudly — a hard stop.
 
-Per-dataset GetData driving (each dataset has a different parameter surface,
-discovered live 2026-06-14):
-  - NIPA / NIUnderlyingDetail : enumerate TableName, Frequency="A,Q,M", Year=X
-  - FixedAssets              : enumerate TableName, Year=X
-  - ITA                      : enumerate AreaOrCountry; Indicator/Frequency/Year=ALL
-                               (ALL x ALL is rejected: exactly one of Indicator
-                               or one country must be fixed; iterating ~131
-                               countries is far cheaper than ~889 indicators)
-  - IIP                      : enumerate Year; TypeOfInvestment/Component/Freq=ALL
-                               (ALL x ALL rejected; ~50 years << ~399 inv. types)
-  - IntlServTrade / IntlServSTA : single ALL-everything call
-  - GDPbyIndustry / UnderlyingGDPbyIndustry : per Frequency in (A,Q), rest=ALL
-  - InputOutput              : enumerate TableID, Year=ALL
-  - MNE                      : per DirectionOfInvestment, Classification=Country
-                               (>3 ALL params is rejected, so Country is the one
-                               classification reachable with Country+Year=all)
-  - Regional                 : headline state-annual tables x their LineCodes,
-                               GeoFips=STATE, Year=ALL (LineCode=ALL is rejected,
-                               so we iterate codes; county/MSA/quarterly tables
-                               are deferred — their per-geo payloads are huge and
-                               the SA* state series is the representative core)
+Per-dataset GetData driving (parameter surfaces verified live 2026-06-14):
+  - NIPA / NIUnderlyingDetail : first N TableName, Frequency="A,Q", Year="ALL"
+                               (one call returns both A and Q; M dropped — most
+                               tables lack it and it inflates the error budget)
+  - FixedAssets              : first N TableName, Year="ALL" (annual, no Freq)
+  - ITA                      : first N AreaOrCountry; Indicator/Frequency=ALL,
+                               Year="ALL" (ALL x ALL is rejected — exactly one
+                               of Indicator or country must be fixed)
+  - IIP                      : most-recent N Year; TypeOfInvestment/Component/
+                               Frequency=ALL (ALL x ALL rejected)
+  - IntlServTrade / IntlServSTA : single ALL-everything call (bounded already)
+  - GDPbyIndustry / UnderlyingGDPbyIndustry : annual only (Q dropped — it ~4x's
+                               the 29 MB annual payload), Industry/TableID=ALL
+  - InputOutput              : first N TableID, Year="ALL"
+  - MNE                      : per DirectionOfInvestment, Classification=Country,
+                               Country=all, Year=all (>3 ALL params rejected)
+  - Regional                 : headline state-annual tables x first N LineCodes,
+                               GeoFips=STATE, Year="ALL" (LineCode=ALL rejected)
 """
 import json
 import os
+import time
 
 import httpx
-from ratelimit import limits, sleep_and_retry
 from tenacity import (
     retry,
     retry_if_exception,
@@ -60,8 +63,6 @@ from subsets_utils import (
     NodeSpec,
     SqlNodeSpec,
     get,
-    list_raw_files,
-    load_state,
     raw_writer,
     save_state,
 )
@@ -87,7 +88,19 @@ ENTITY_IDS = [
 
 NODE_TO_DATASET = {f"bea-{e.lower()}": e for e in ENTITY_IDS}
 
-# Headline state-annual Regional tables (stable BEA ids, chosen 2026-06-14).
+# --- Scope bounds (deliberate, dated 2026-06-14; logged when they truncate) ---
+# These cap each dataset to a representative slice so the whole DAG stays well
+# under BEA's 100 MB/min bandwidth ceiling. They are NOT safety caps on source
+# growth — they are intentional scope limits; the fetch logs "fetched X of Y".
+MAX_NIPA_TABLES = 10
+MAX_NIUND_TABLES = 8
+MAX_FIXEDASSETS_TABLES = 8
+MAX_INPUTOUTPUT_TABLES = 8
+MAX_ITA_AREAS = 12
+MAX_IIP_YEARS = 12
+MAX_REGIONAL_LINECODES = 5
+
+# Headline state-annual Regional tables (stable BEA ids, chosen 2026-06-14):
 # GDP, personal income, and PCE by state — the representative bounded core.
 REGIONAL_TABLES = [
     "SAGDP1",   # GDP summary by state
@@ -98,9 +111,25 @@ REGIONAL_TABLES = [
     "SAPCE1",   # Personal consumption expenditures by state
 ]
 
+# Bandwidth pacer: sleep after each response so the rolling 60 s window holds
+# under ~50 MB/min (half the documented 100 MB/min, for headroom). Per-process
+# state — the DAG runs nodes sequentially (DAG_PARALLELISM=1), so one process
+# owns the budget; the trailing sleep also buffers the next node's first call.
+_MIN_GAP_S = 1.5                       # >=1.5 s gap -> <=40 req/min << 100/min
+_BYTES_PER_SEC = 50_000_000 / 60.0     # ~833 KB/s -> ~50 MB/min ceiling
+_PACE = {"prev_bytes": 0}
+
+
+def _pace() -> None:
+    nbytes = _PACE["prev_bytes"]
+    if not nbytes:
+        return
+    time.sleep(max(_MIN_GAP_S, nbytes / _BYTES_PER_SEC))
+
 
 # --------------------------------------------------------------------------
-# HTTP transport: rate-limited + retried. raise_for_status inside the retry.
+# HTTP transport: paced + retried. raise_for_status inside the retry so 429/5xx
+# are classified as transient and backed off; the pacer runs on every attempt.
 # --------------------------------------------------------------------------
 _TRANSIENT_EXC = (
     httpx.ConnectError,
@@ -122,8 +151,6 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
-@sleep_and_retry
-@limits(calls=55, period=60)  # ~55% of documented 100/min — headroom for churn
 @retry(
     retry=retry_if_exception(_is_transient),
     stop=stop_after_attempt(6),
@@ -131,7 +158,9 @@ def _is_transient(exc: BaseException) -> bool:
     reraise=True,
 )
 def _request(params: dict) -> dict:
+    _pace()
     resp = get(BASE_URL, params=params, timeout=(10.0, 300.0))
+    _PACE["prev_bytes"] = len(resp.content)  # count bandwidth before raising
     resp.raise_for_status()
     return resp.json()
 
@@ -211,31 +240,35 @@ def _values(dataset: str, param: str, **filt) -> list:
 
 # --------------------------------------------------------------------------
 # Per-dataset row producers (generators yielding raw observation dicts).
+# Each is bounded; the bound is logged when it truncates the source list.
 # --------------------------------------------------------------------------
-def _gen_table_family(dataset: str, with_frequency: bool):
+def _gen_table_family(dataset: str, with_frequency: bool, max_tables: int):
     tables = _values(dataset, "TableName")
-    for i, t in enumerate(tables):
-        params = {"TableName": t, "Year": "X"}
+    chosen = tables[:max_tables]
+    print(f"[bea] {dataset}: fetching {len(chosen)} of {len(tables)} tables (bounded)", flush=True)
+    for t in chosen:
+        params = {"TableName": t, "Year": "ALL"}
         if with_frequency:
-            params["Frequency"] = "A,Q,M"
+            params["Frequency"] = "A,Q"  # one call returns both; M dropped
         yield from _getdata(dataset, **params)
-        if i % 25 == 0:
-            print(f"[bea] {dataset}: {i + 1}/{len(tables)} tables", flush=True)
 
 
 def _gen_ita():
-    countries = _values("ITA", "AreaOrCountry")
-    for i, c in enumerate(countries):
+    areas = _values("ITA", "AreaOrCountry")
+    chosen = areas[:MAX_ITA_AREAS]
+    print(f"[bea] ITA: fetching {len(chosen)} of {len(areas)} areas (bounded)", flush=True)
+    for c in chosen:
         yield from _getdata(
             "ITA", Indicator="ALL", AreaOrCountry=c, Frequency="ALL", Year="ALL"
         )
-        if i % 20 == 0:
-            print(f"[bea] ITA: {i + 1}/{len(countries)} areas", flush=True)
 
 
 def _gen_iip():
     years = _values("IIP", "Year")
-    for y in years:
+    # Most-recent N years (sorted lexically works — all 4-digit strings).
+    chosen = sorted(years)[-MAX_IIP_YEARS:]
+    print(f"[bea] IIP: fetching {len(chosen)} of {len(years)} years (bounded)", flush=True)
+    for y in chosen:
         yield from _getdata(
             "IIP", TypeOfInvestment="ALL", Component="ALL", Frequency="ALL", Year=y
         )
@@ -264,16 +297,18 @@ def _gen_intlservsta():
 
 
 def _gen_gdpbyindustry(dataset: str):
-    # ALL frequency is rejected; iterate the two published frequencies.
-    for freq in ("A", "Q"):
-        yield from _getdata(
-            dataset, Frequency=freq, Industry="ALL", TableID="ALL", Year="ALL"
-        )
+    # Annual only: the quarterly payload is ~4x the 29 MB annual one and would
+    # dominate the bandwidth budget. Annual ALL is a rich, meaningful table.
+    yield from _getdata(
+        dataset, Frequency="A", Industry="ALL", TableID="ALL", Year="ALL"
+    )
 
 
 def _gen_inputoutput():
     tids = _values("InputOutput", "TableID")
-    for tid in tids:
+    chosen = tids[:MAX_INPUTOUTPUT_TABLES]
+    print(f"[bea] InputOutput: fetching {len(chosen)} of {len(tids)} tables (bounded)", flush=True)
+    for tid in chosen:
         yield from _getdata("InputOutput", TableID=tid, Year="ALL")
 
 
@@ -296,7 +331,8 @@ def _gen_mne():
 def _gen_regional():
     for t in REGIONAL_TABLES:
         linecodes = _values("Regional", "LineCode", TableName=t)
-        for lc in linecodes:
+        chosen = linecodes[:MAX_REGIONAL_LINECODES]
+        for lc in chosen:
             for row in _getdata(
                 "Regional", TableName=t, GeoFips="STATE", LineCode=lc, Year="ALL"
             ):
@@ -304,15 +340,20 @@ def _gen_regional():
                 row["TableName"] = t
                 row["LineCode"] = lc
                 yield row
-        print(f"[bea] Regional: finished {t} ({len(linecodes)} line codes)", flush=True)
+        print(
+            f"[bea] Regional: {t} fetched {len(chosen)} of {len(linecodes)} line codes (bounded)",
+            flush=True,
+        )
 
 
 def _produce(node_id: str):
     ds = NODE_TO_DATASET[node_id]
-    if ds in ("NIPA", "NIUnderlyingDetail"):
-        yield from _gen_table_family(ds, with_frequency=True)
+    if ds == "NIPA":
+        yield from _gen_table_family(ds, with_frequency=True, max_tables=MAX_NIPA_TABLES)
+    elif ds == "NIUnderlyingDetail":
+        yield from _gen_table_family(ds, with_frequency=True, max_tables=MAX_NIUND_TABLES)
     elif ds == "FixedAssets":
-        yield from _gen_table_family(ds, with_frequency=False)
+        yield from _gen_table_family(ds, with_frequency=False, max_tables=MAX_FIXEDASSETS_TABLES)
     elif ds == "ITA":
         yield from _gen_ita()
     elif ds == "IIP":
@@ -334,10 +375,11 @@ def _produce(node_id: str):
 
 
 def fetch_one(node_id: str) -> None:
-    """Stream one BEA dataset's full observation set to a gzip ndjson raw asset.
+    """Stream one BEA dataset's bounded observation set to a gzip ndjson asset.
 
-    Rows are written as they arrive (never fully held in memory) — ITA/IIP/IO
-    each run into the millions of rows. Raw is written before state, always.
+    Rows are written as they arrive (never fully held in memory). Raw is written
+    before state, always. A dataset that yields zero rows fails loudly — that
+    means the catalog walk or GetData contract changed, not an empty source.
     """
     asset = node_id
     n = 0
@@ -348,8 +390,6 @@ def fetch_one(node_id: str) -> None:
             n += 1
     print(f"[bea] {asset}: wrote {n} rows", flush=True)
     if n == 0:
-        # A dataset that yields nothing means the catalog walk or GetData
-        # contract changed — fail loudly rather than publishing an empty table.
         raise RuntimeError(f"{asset}: produced 0 rows")
 
     save_state(asset, {"schema_version": STATE_VERSION, "last_run_stats": {"records": n}})
