@@ -7,6 +7,14 @@ or a parse that yields all-null dimensions.
 
 from subsets_utils import load_raw_ndjson
 
+# `spec_ids` passed to the test harness covers every spec that ran — both the
+# download nodes AND the `-transform` leaves. Only the download nodes write raw
+# NDJSON; the transforms publish Delta tables. Restrict to the raw-bearing
+# download ids before loading, else `load_raw_ndjson` 404s on a transform id.
+def _download_ids(spec_ids):
+    return [sid for sid in spec_ids if not sid.endswith("-transform")]
+
+
 # Conservative floors well below observed corpus sizes (smallest, nowcasting,
 # was ~170 rows; the large endpoints are 100k+). A real fetch should clear these.
 _MIN_ROWS = {
@@ -23,7 +31,7 @@ _MIN_ROWS = {
 
 def test_all_raw_assets_nonempty(spec_ids):
     """Every endpoint's raw NDJSON should hold a plausible number of rows."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         rows = load_raw_ndjson(sid)
         floor = _MIN_ROWS.get(sid, 1)
         assert len(rows) >= floor, f"{sid}: {len(rows)} rows < expected floor {floor}"
@@ -32,7 +40,7 @@ def test_all_raw_assets_nonempty(spec_ids):
 def test_core_dimensions_present(spec_ids):
     """Each row must carry year + origin/asylum keys, and at least some years
     must parse as integers — guards against a header/format shift."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         rows = load_raw_ndjson(sid)
         sample = rows[: min(2000, len(rows))]
         for key in ("year", "country_of_origin_iso", "country_of_asylum_iso"):
