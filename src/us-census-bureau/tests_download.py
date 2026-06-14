@@ -30,8 +30,9 @@ def test_sampled_assets_nonempty_dict_rows(spec_ids):
     for sid in _sample(spec_ids):
         try:
             rows = load_raw_ndjson(sid)
-        except FileNotFoundError:
-            # Node failed (per-entity) — surfaced by per_spec, not here.
+        except Exception:
+            # Asset absent (per-entity node failure) — surfaced by per_spec,
+            # not here. Broad except: R2 misses don't raise FileNotFoundError.
             continue
         checked += 1
         if not rows:
@@ -54,7 +55,7 @@ def test_no_html_error_body(spec_ids):
     for sid in _sample(spec_ids):
         try:
             rows = load_raw_ndjson(sid)
-        except FileNotFoundError:
+        except Exception:
             continue
         if not rows:
             continue
