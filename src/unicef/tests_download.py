@@ -17,6 +17,15 @@ from subsets_utils import raw_reader
 SAMPLE = 5000  # rows inspected per asset — enough to catch shape/format breaks
 
 
+def _download_ids(spec_ids):
+    """spec_ids carries EVERY DAG node id — both the download assets (which own
+    a raw NDJSON.gz file) and the `-transform` leaf nodes (which publish a Delta
+    table and own no raw file). Health tests inspect raw, so keep only the
+    download ids; loading a `-transform` id as raw NDJSON is a guaranteed
+    FileNotFoundError."""
+    return [sid for sid in spec_ids if not sid.endswith("-transform")]
+
+
 def _sample_rows(sid):
     """Yield up to SAMPLE parsed rows from an asset's NDJSON.gz without loading
     the whole file."""
@@ -32,7 +41,7 @@ def _sample_rows(sid):
 def test_all_raw_assets_nonempty(spec_ids):
     """Every dataflow must yield observation rows. An empty payload usually
     means the endpoint changed format or returned an empty 200."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         rows = list(_sample_rows(sid))
         assert len(rows) > 0, f"{sid}: raw NDJSON has 0 rows"
 
@@ -46,7 +55,7 @@ def test_obs_value_present_and_populated(spec_ids):
     categorical measure there (CCRI risk bands like "Extremely High"), so a
     numeric-fraction check would wrongly fail those flows; we only assert the
     column is present and non-blank for most rows."""
-    for sid in spec_ids:
+    for sid in _download_ids(spec_ids):
         rows = list(_sample_rows(sid))
         assert rows, f"{sid}: no rows to check obs_value"
         assert all("obs_value" in r for r in rows), \
