@@ -41,8 +41,18 @@ def test_raw_schema_and_values(spec_ids):
         non_null_values = pc.count(table.column("value"), mode="only_valid").as_py()
         assert non_null_values > 0, f"{sid}: every value is null"
 
-        # series_code and period must be populated for the published rows.
+        # series_code must always be populated.
         null_codes = pc.count(table.column("series_code"), mode="only_null").as_py()
         assert null_codes == 0, f"{sid}: {null_codes} rows with null series_code"
+
+        # Period must be populated for the overwhelming majority of rows. The
+        # source sporadically reports an observation with a value but an empty
+        # survey date (e.g. ~1.5k of CO/TANKAN's tens of millions of rows); raw
+        # keeps these faithfully and the transform drops them. A *high* null
+        # rate, by contrast, signals a real format break worth failing on.
+        n = table.num_rows
         null_periods = pc.count(table.column("period"), mode="only_null").as_py()
-        assert null_periods == 0, f"{sid}: {null_periods} rows with null period"
+        assert null_periods / n < 0.01, (
+            f"{sid}: {null_periods}/{n} rows ({null_periods / n:.1%}) have a "
+            f"null period — exceeds 1% tolerance for source malformations"
+        )

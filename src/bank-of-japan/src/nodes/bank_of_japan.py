@@ -241,7 +241,10 @@ def _transform_sql(download_id: str) -> str:
             {_DATE_SQL} AS date,
             CAST(value AS DOUBLE) AS value
         FROM "{download_id}"
-        WHERE value IS NOT NULL
+        -- Drop observations the source reports with a value but no survey date
+        -- (a sporadic malformation seen in a few CO/TANKAN series): an
+        -- observation with no period cannot be placed on a timeline.
+        WHERE value IS NOT NULL AND period IS NOT NULL
     '''
 
 
